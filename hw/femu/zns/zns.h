@@ -11,6 +11,15 @@
 #include "../nvme.h"
 #include "zftl.h"
 
+/*
+ * zns.h
+ * -----
+ * 简体中文说明：
+ * 该头文件定义了 ZNS (Zoned Namespace) 模拟中使用的常量、数据结构
+ * 与内联辅助函数。注释旨在帮助阅读者理解每个结构字段和函数用途，
+ * 便于在不改变功能的前提下进行维护。
+ */
+
 #define LOGICAL_PAGE_SIZE (4*KiB)
 #define ZNS_PAGE_SIZE (16*KiB)
 #define ZNS_DEFAULT_NUM_WRITE_CACHE (3)
@@ -81,10 +90,24 @@ struct ppa {
     };
 };
 
+/*
+ * struct ppa
+ * 代表物理页地址 (Physical Page Address) 的紧凑表示。
+ * - g 字段按位域定义了通道/平面/块/页等层次信息，
+ * - ppa 为整体的 64 位表示（便于直接比较和赋值）。
+ * - V 位用于指示是否为有效（非 padding）页。
+ */
+
 struct write_pointer {
     uint64_t ch;
     uint64_t lun;
 };
+
+/*
+ * struct write_pointer
+ * 用于记录当前写指针的通道/lun 位置信息，FTL 在分配新物理页时
+ * 会基于该写指针做轮询式分配（见实现中的 advance 写指针逻辑）。
+ */
 
 struct nand_cmd {
     int cmd;
@@ -92,12 +115,22 @@ struct nand_cmd {
     uint64_t stime;
 };
 
+/*
+ * struct nand_cmd
+ * 表示一个 NAND 层的命令（读/写/擦除）及其发起时间和类型（用户 IO / GC）。
+ */
+
 
 struct zns_blk {
     int nand_type;
     uint64_t next_blk_avail_time;
     uint64_t page_wp; //next free page
 };
+
+/*
+ * struct zns_blk
+ * 描述物理块级别信息：NAND 类型、下一次可用时间、以及块内的下一个空页索引。
+ */
 
 struct zns_plane{
     struct zns_blk *blk;
@@ -114,12 +147,24 @@ struct zns_ch {
     uint64_t next_ch_avail_time;
 };
 
+/*
+ * zns_plane / zns_fc / zns_ch
+ * 分别表示平面、闪存芯片 (flash chip) 的子结构和通道，
+ * 每层包含下一层的数组指针以及表示该层并行性/可用性的时间戳。
+ */
+
 
 typedef struct SSDNandFlashTiming {
     uint64_t pg_rd_lat[MAX_FLASH_TYPE];  /* NAND page read latency in nanoseconds */
     uint64_t pg_wr_lat[MAX_FLASH_TYPE]; /* NAND page program latency in nanoseconds */
     uint64_t blk_er_lat[MAX_FLASH_TYPE]; /* NAND block erase latency in nanoseconds */
 } SSDNandFlashTiming;
+
+/*
+ * SSDNandFlashTiming
+ * 用于保存不同 NAND 类型（SLC/TLC/QLC）在页读/页写/块擦除上的延时，
+ * 单位为纳秒，FTL/模拟层会基于这些值计算请求延迟。
+ */
 
 struct zns_write_cache{
     uint64_t sblk; //idx of corresponding superblock
@@ -128,10 +173,20 @@ struct zns_write_cache{
     uint64_t* lpns; //identify the cached data
 };
 
+/*
+ * zns_write_cache
+ * 简单的写缓存结构：记录所属超级块索引、已用条目数、容量以及保存的 LPN 列表。
+ */
+
 struct zns_sram{
     int num_wc;
     struct zns_write_cache* write_cache;
 };
+
+/*
+ * zns_sram
+ * 模拟设备内部的快速缓存（SRAM），目前只包含多个写缓存 (write cache) 的数组。
+ */
 
 struct zns_ssd {
     uint64_t num_ch;
@@ -162,6 +217,12 @@ struct zns_ssd {
     uint32_t lbasz;
     uint32_t active_zone;
 };
+
+/*
+ * struct zns_ssd
+ * 高层次的 ZNS SSD 模拟对象：包含通道/平面/块/页数量、硬件计时、缓存、
+ * L2P 映射表以及与 NVMe 数据平面通信的环形队列和 FTL 线程句柄。
+ */
 
 enum NvmeZoneAttr {
     NVME_ZA_FINISHED_BY_CTLR         = 1 << 0,

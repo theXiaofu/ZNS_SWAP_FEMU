@@ -1,5 +1,14 @@
 #include "zns.h"
 
+/*
+ * zftl.c
+ * -----
+ * 简体中文说明：
+ * 本文件实现了一个非常精简的 FTL 后台线程，用于处理来自数据平面
+ * 的读写请求（通过 lockless ring 进行通信）。注释仅用于说明各个
+ * 函数的职责、并行性和延时计算方法，不修改原有实现逻辑。
+ */
+
 //#define FEMU_DEBUG_ZFTL
 
 static void *ftl_thread(void *arg);
@@ -22,6 +31,12 @@ void zftl_init(FemuCtrl *n)
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
 }
+
+/*
+ * zftl_init
+ * 创建并启动 FTL 后台线程（可 join）。线程负责从 to_ftl 队列读取请求、
+ * 执行读写逻辑并将请求返回到 to_poller 队列。
+ */
 
 static inline struct zns_ch *get_ch(struct zns_ssd *zns, struct ppa *ppa)
 {
@@ -51,6 +66,12 @@ static inline void check_addr(int a, int max)
    assert(a >= 0 && a < max);
 }
 
+/*
+ * get_ch/get_fc/get_plane/get_blk
+ * 层级访问辅助函数，返回对应层次的数据结构指针。这些函数通过
+ * ppa 的位域值索引数组，请确保 ppa 合法性以避免越界。
+ */
+
 static void zns_advance_write_pointer(struct zns_ssd *zns)
 {
     struct write_pointer *wpp = &zns->wp;
@@ -67,6 +88,12 @@ static void zns_advance_write_pointer(struct zns_ssd *zns)
         }
     }
 }
+
+/*
+ * zns_advance_write_pointer
+ * 将写指针按通道轮询前进；当当前通道耗尽，会进位到下一个 lun，再循环。
+ * 此逻辑用于实现多通道/多 lun 的带宽分布（round-robin allocation）。
+ */
 
 static uint64_t zns_advance_status(struct zns_ssd *zns, struct ppa *ppa,struct nand_cmd *ncmd)
 {
@@ -116,6 +143,13 @@ static uint64_t zns_advance_status(struct zns_ssd *zns, struct ppa *ppa,struct n
     return lat;
 }
 
+/*
+ * zns_advance_status
+ * 基于命令类型和目标 plane 的可用时间计算并更新延迟（纳秒）。
+ * 返回子操作引入的延迟（sublat）。该函数模拟了 NAND 的并行性：
+ * 同一 plane 上的命令必须串行化，下一可用时间基于 plane 级别维护。
+ */
+
 static inline bool valid_ppa(struct zns_ssd *zns, struct ppa *ppa)
 {
     int ch = ppa->g.ch;
@@ -131,6 +165,11 @@ static inline bool valid_ppa(struct zns_ssd *zns, struct ppa *ppa)
 
     return false;
 }
+
+/*
+ * valid_ppa / mapped_ppa
+ * 校验 ppa 是否落在设备几何范围内，以及是否已被映射（判定为 UNMAPPED_PPA）。
+ */
 
 static inline bool mapped_ppa(struct ppa *ppa)
 {
@@ -154,6 +193,12 @@ static struct ppa get_new_page(struct zns_ssd *zns)
     return ppa;
 }
 
+/*
+ * get_new_page
+ * 从写指针位置构造一个新的 ppa（尚未填充 pg/pl 等字段），并标记为有效。
+ * 若生成的 ppa 超出范围，会返回 UNMAPPED_PPA 以便上层检测异常。
+ */
+
 static int zns_get_wcidx(struct zns_ssd* zns)
 {
     int i;
@@ -166,6 +211,12 @@ static int zns_get_wcidx(struct zns_ssd* zns)
     }
     return -1;
 }
+
+/*
+ * zns_get_wcidx
+ * 在写缓存数组中查找与当前活动超级块 (active_zone) 对应的写缓存索引。
+ * 未找到时返回 -1（表示需要分配或触发 flush）。
+ */
 
 static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
 {
@@ -198,6 +249,13 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
 
     return maxlat;
 }
+
+/*
+ * zns_read
+ * 读取路径的简化实现：遍历涉及的 LPN，查询映射表找出 PPA，
+ * 并通过 zns_advance_status 模拟每个页的读延迟，返回最大延迟值。
+ * 非映射的 LPN 会被跳过（例如读取空洞时）。
+ */
 
 static uint64_t zns_wc_flush(struct zns_ssd* zns, int wcidx, int type,uint64_t stime)
 {
@@ -257,6 +315,13 @@ static uint64_t zns_wc_flush(struct zns_ssd* zns, int wcidx, int type,uint64_t s
     return maxlat;
 }
 
+/*
+ * zns_wc_flush
+ * 将写缓存中的条目打包写入闪存：为每个待写 LPN 分配物理页（按 plane 和 flash_type
+ * 处理多页写入），更新映射表，并调用 zns_advance_status 获取写延迟。
+ * 函数返回处理过程中的最大延迟，用于上层统计/延时累积。
+ */
+
 static uint64_t zns_write(struct zns_ssd *zns, NvmeRequest *req)
 {
     uint64_t lba = req->slba;
@@ -308,6 +373,13 @@ static uint64_t zns_write(struct zns_ssd *zns, NvmeRequest *req)
     }
     return maxlat;
 }
+
+/*
+ * zns_write
+ * 写路径：先尝试找到与当前 active_zone 匹配的写缓存；若没有可用缓存，
+ * 选择一个需要 flush 的缓存并执行 zns_wc_flush。写入操作先写入缓存（模拟 SRAM 延迟），
+ * 当缓存满或需要回收时触发实际闪存写入。
+ */
 
 static void *ftl_thread(void *arg)
 {
@@ -368,3 +440,10 @@ static void *ftl_thread(void *arg)
 
     return NULL;
 }
+
+/*
+ * ftl_thread
+ * FTL 后台线程主循环：等待数据平面启动后读取来自多个 poller 的请求队列，
+ * 根据命令类型调用 zns_read/zns_write 等处理函数，设置 req->reqlat 和 expire_time，
+ * 并将请求放回到 to_poller 队列供上层轮询线程继续完成请求生命周期。
+ */

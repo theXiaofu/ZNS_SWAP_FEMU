@@ -4,12 +4,29 @@
 #define NVME_DEFAULT_ZONE_SIZE      (128 * MiB)
 #define NVME_DEFAULT_MAX_AZ_SIZE    (128 * KiB)
 
+/*
+ * zns.c - 简体中文概述
+ * 该文件实现了 ZNS（Zoned Namespace）相关的核心逻辑：
+ * - Zone 几何与描述符的初始化与校验
+ * - Zone 状态机（open/close/finish/reset/offline）以及 AOR（Active/Open Resources）管理
+ * - Zone IO（读/写/append）路径与 Zone 管理命令（SEND/RECV）的处理
+ * - ZNS 设备参数与内部模拟结构（通道/平面/块/页）的初始化
+ *
+ * 注：本文件内仅添加注释以提高可读性，未修改任何功能性代码。
+ */
+
 static inline uint32_t zns_zone_idx(NvmeNamespace *ns, uint64_t slba)
 {
     FemuCtrl *n = ns->ctrl;
 
     return (n->zone_size_log2 > 0 ? slba >> n->zone_size_log2 : slba / n->zone_size);
 }
+
+/*
+ * zns_zone_idx
+ * 将逻辑块地址 (slba) 转换为 zone 索引。
+ * 优先使用位移运算（当 zone 大小为 2 的幂时），否则使用除法。
+ */
 
 static inline NvmeZone *zns_get_zone_by_slba(NvmeNamespace *ns, uint64_t slba)
 {
@@ -19,6 +36,11 @@ static inline NvmeZone *zns_get_zone_by_slba(NvmeNamespace *ns, uint64_t slba)
     assert(zone_idx < n->num_zones);
     return &n->zone_array[zone_idx];
 }
+
+/*
+ * zns_get_zone_by_slba
+ * 根据给定的 slba 获取对应的 NvmeZone 结构体指针（调用者需保证 slba 有效）。
+ */
 
 static int zns_init_zone_geometry(NvmeNamespace *ns, Error **errp)
 {
@@ -80,6 +102,12 @@ static int zns_init_zone_geometry(NvmeNamespace *ns, Error **errp)
     return 0;
 }
 
+/*
+ * zns_init_zone_geometry
+ * 初始化与 zone 大小/容量/数量相关的几何参数，并进行输入值校验。
+ * 例如：zone cap 必须不大于 zone size，zd_extension 必须是 64B 的倍数等。
+ */
+
 static void zns_init_zoned_state(NvmeNamespace *ns)
 {
     FemuCtrl *n = ns->ctrl;
@@ -118,6 +146,13 @@ static void zns_init_zoned_state(NvmeNamespace *ns)
         n->zone_size_log2 = 63 - clz64(n->zone_size);
     }
 }
+
+/*
+ * zns_init_zoned_state
+ * 为命名空间分配 zone 数组并初始化每个 zone 的描述符（类型、容量、
+ * 起始 LBA、写指针等）。如果存在 zone descriptor extension，则为
+ * 每个 zone 分配扩展区。
+ */
 
 static void zns_init_zone_identify(FemuCtrl *n, NvmeNamespace *ns, int lba_index)
 {
@@ -160,6 +195,12 @@ static void zns_init_zone_identify(FemuCtrl *n, NvmeNamespace *ns, int lba_index
     n->id_ns_zoned = id_ns_z;
 }
 
+/*
+ * zns_init_zone_identify
+ * 构建 Identify Namespace 的 zoned 扩展结构，设置 MAR/MOR、ZOC/ OZCS 等
+ * 字段以及 LBA 格式中 zone 大小和 zd_extension 的单元信息。
+ */
+
 static void zns_clear_zone(NvmeNamespace *ns, NvmeZone *zone)
 {
     FemuCtrl *n = ns->ctrl;
@@ -177,6 +218,12 @@ static void zns_clear_zone(NvmeNamespace *ns, NvmeZone *zone)
         zns_set_zone_state(zone, NVME_ZONE_STATE_EMPTY);
     }
 }
+
+/*
+ * zns_clear_zone
+ * 将单个 zone 恢复到 Empty 或 Closed 状态（依据描述符中 wp 与 zslba 的值），
+ * 并在必要时更新 AOR 计数器与队列结构。
+ */
 
 static void zns_zoned_ns_shutdown(NvmeNamespace *ns)
 {
@@ -266,6 +313,14 @@ static void zns_assign_zone_state(NvmeNamespace *ns, NvmeZone *zone, NvmeZoneSta
 }
 
 /*
+ * zns_assign_zone_state
+ * 将 zone 从当前状态迁移到目标状态：
+ * - 从原链表中移除（若在链表中）
+ * - 设置 zs 字段并插入到目标链表
+ * - 在需要时维护 nr_open_zones / nr_active_zones 等计数器
+ */
+
+/*
  * Check if we can open a zone without exceeding open/active limits.
  * AOR stands for "Active and Open Resources" (see TP 4053 section 2.5).
  */
@@ -283,6 +338,12 @@ static int zns_aor_check(NvmeNamespace *ns, uint32_t act, uint32_t opn)
 
     return NVME_SUCCESS;
 }
+
+/*
+ * zns_aor_check
+ * 检查执行某个操作后是否会超出最大允许的 active/open zones，
+ * 用于拒绝会导致资源超额的命令。
+ */
 
 static uint16_t zns_check_zone_state_for_write(NvmeZone *zone)
 {
@@ -310,6 +371,11 @@ static uint16_t zns_check_zone_state_for_write(NvmeZone *zone)
 
     return status;
 }
+
+/*
+ * zns_check_zone_state_for_write
+ * 基于 zone 的当前状态判断是否允许写入，并返回对应的 NVMe 错误码。
+ */
 
 static uint16_t zns_check_zone_write(FemuCtrl *n, NvmeNamespace *ns,
                                      NvmeZone *zone, uint64_t slba,
@@ -340,6 +406,12 @@ static uint16_t zns_check_zone_write(FemuCtrl *n, NvmeNamespace *ns,
 
     return status;
 }
+
+/*
+ * zns_check_zone_write
+ * 进行写请求级别的校验：边界检查、状态检查、append 模式下的特定
+ * 约束（例如写入长度不超过 page size * 2^zasl）以及写指针一致性。
+ */
 
 static uint16_t zns_check_zone_state_for_read(NvmeZone *zone)
 {
@@ -396,6 +468,12 @@ static uint16_t zns_check_zone_read(NvmeNamespace *ns, uint64_t slba, uint32_t n
     return status;
 }
 
+/*
+ * zns_check_zone_read
+ * 校验读请求是否合法，若跨 zone 读则依据 cross_zone_read 标志决定是否允许，
+ * 并对跨越的每个 zone 检查其读权限。
+ */
+
 static void zns_auto_transition_zone(NvmeNamespace *ns)
 {
     FemuCtrl *n = ns->ctrl;
@@ -413,6 +491,12 @@ static void zns_auto_transition_zone(NvmeNamespace *ns)
     }
 }
 
+/*
+ * zns_auto_transition_zone
+ * 当隐式打开区数量达到控制器限制时，自动关闭最旧的隐式打开区以
+ * 释放资源（实现 AOR 策略的一部分）。
+ */
+
 static uint16_t zns_auto_open_zone(NvmeNamespace *ns, NvmeZone *zone)
 {
     uint16_t status = NVME_SUCCESS;
@@ -428,6 +512,12 @@ static uint16_t zns_auto_open_zone(NvmeNamespace *ns, NvmeZone *zone)
 
     return status;
 }
+
+/*
+ * zns_auto_open_zone
+ * 在需要隐式打开 zone 的场景（如 append）中调用，执行 AOR 检查并
+ * 将 zone 状态从 Empty/Closed 转换为 Implicitly Open（或进一步转换）。
+ */
 
 static void zns_finalize_zoned_write(NvmeNamespace *ns, NvmeRequest *req, bool failed)
 {
@@ -467,6 +557,12 @@ static void zns_finalize_zoned_write(NvmeNamespace *ns, NvmeRequest *req, bool f
     }
 }
 
+/*
+ * zns_finalize_zoned_write
+ * 写请求完成后的收尾处理：更新 zone 的描述符 wp 字段，根据是否写满
+ * 执行状态转换并维护 AOR 计数器。若写失败，会在返回的 cqe 中写入 0。
+ */
+
 // Add some function
 // --------------------------------
 
@@ -496,6 +592,12 @@ static uint64_t zns_advance_zone_wp(NvmeNamespace *ns, NvmeZone *zone, uint32_t 
 
     return result;
 }
+
+/*
+ * zns_advance_zone_wp
+ * 将 zone 的 w_ptr 推进 nlb 个 LBA，并在第一次写入该 zone 时更新
+ * active/open 计数和状态（可能从 Empty/Cosed -> Implicitly Open）。
+ */
 
 struct zns_zone_reset_ctx {
     NvmeRequest *req;
@@ -542,6 +644,12 @@ static void zns_aio_zone_reset_cb(NvmeRequest *req, NvmeZone *zone)
     }
 #endif
 }
+
+/*
+ * zns_aio_zone_reset_cb
+ * 异步 reset 操作的回调实现：将 zone 写指针回退并把 zone 标记为 Empty，
+ * 同时调整 AOR 计数器。该函数内现在假定 erase 一定成功。
+ */
 
 typedef uint16_t (*op_handler_t)(NvmeNamespace *, NvmeZone *, NvmeZoneState,
                                  NvmeRequest *);
@@ -830,6 +938,12 @@ static uint16_t zns_map_dptr(FemuCtrl *n, size_t len, NvmeRequest *req)
     }
 }
 
+/*
+ * zns_map_dptr
+ * 将请求中的 PRP（或其他 PSDT）映射到 req->iov，准备进行后端 IO。
+ * 目前仅支持 PRP 模式。
+ */
+
 /*Misao: backend read/write without latency emulation*/
 static uint16_t zns_nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                            NvmeRequest *req,bool append)
@@ -916,6 +1030,15 @@ static uint16_t zns_nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
 err:
     return status | NVME_DNR;
 }
+
+/*
+ * zns_nvme_rw
+ * NVMe IO（Read/Write/Zone Append）的统一入口：
+ * - 校验 MDTS/边界/zone 状态
+ * - 对 append 做自动打开与返回旧写地址的处理
+ * - 将主机内存映射到 request 并调用 backend_rw 执行实际数据传输
+ * - 写操作完成后调用 zns_finalize_zoned_write 做收尾工作
+ */
 
 static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
 {
@@ -1012,6 +1135,12 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
 
     return status;
 }
+
+/*
+ * zns_zone_mgmt_send
+ * 处理 Zone Management Send 命令：根据 action（open/close/finish/reset/offline/set_zd_ext）
+ * 调用对应的状态机处理函数，可选择对单个 zone 或所有 zone 执行操作（all 标志）。
+ */
 
 static bool zns_zone_matches_filter(uint32_t zafs, NvmeZone *zl)
 {
@@ -1147,6 +1276,12 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
     return status;
 }
 
+/*
+ * zns_zone_mgmt_recv
+ * 实现 Zone Management Receive（Report Zones）：根据请求参数生成 zone 列表
+ * 并写回到主机缓冲区，支持扩展描述符（如果控制器配置了 zd_extension）。
+ */
+
 static inline bool nvme_csi_has_nvm_support(NvmeNamespace *ns)
 {
     switch (ns->ctrl->csi) {
@@ -1193,6 +1328,11 @@ static void zns_set_ctrl_str(FemuCtrl *n)
     nvme_set_ctrl_name(n, zns_mn, zns_sn, &fsid_zns);
 }
 
+/*
+ * zns_set_ctrl_str
+ * 设置控制器的制造商字符串和序列号，便于区分该模拟设备。
+ */
+
 static void zns_set_ctrl(FemuCtrl *n)
 {
     uint8_t *pci_conf = n->parent_obj.config;
@@ -1201,6 +1341,11 @@ static void zns_set_ctrl(FemuCtrl *n)
     pci_config_set_vendor_id(pci_conf, PCI_VENDOR_ID_INTEL);
     pci_config_set_device_id(pci_conf, 0x5845);
 }
+
+/*
+ * zns_set_ctrl
+ * 设置控制器的 PCI vendor/device id 等基础信息，并调用 zns_set_ctrl_str。
+ */
 
 // Add zns init ch, zns init flash and zns init block
 // ----------------------------
@@ -1312,6 +1457,12 @@ static void zns_init_params(FemuCtrl *n)
     zftl_init(n);
 }
 
+/*
+ * zns_init_blk/plane/fc/ch/params
+ * 负责层级化分配存储层对象并初始化其字段（nand 类型、page write pointer、
+ * 各层下一可用时间等），同时为 L2P 映射表和写缓存分配内存。
+ */
+
 static int zns_init_zone_cap(FemuCtrl *n)
 {
     assert(n->zns);
@@ -1327,6 +1478,12 @@ static int zns_init_zone_cap(FemuCtrl *n)
 
     return 0;
 }
+
+/*
+ * zns_init_zone_cap
+ * 将命名空间配置为 Zoned 模式，并计算与 zone 大小相关的字节数参数，
+ * 初始化 cross_zone_read 与其他能力标志。
+ */
 
 static int zns_start_ctrl(FemuCtrl *n)
 {
@@ -1362,6 +1519,12 @@ static void zns_init(FemuCtrl *n, Error **errp)
     zns_init_zone_identify(n, ns, 0);
 }
 
+/*
+ * zns_init
+ * ZNS 扩展的入口点：设置控制器属性、初始化 zns 参数并完成 zone 相关
+ * 的几何与 identify 初始化。
+ */
+
 static void zns_exit(FemuCtrl *n)
 {
     /*
@@ -1384,3 +1547,9 @@ int nvme_register_znssd(FemuCtrl *n)
 
     return 0;
 }
+
+/*
+ * nvme_register_znssd
+ * 将 ZNS 的扩展函数集合注册到控制器的 ext_ops 中，使得 Femu 在
+ * 创建命名空间时能够使用这些扩展功能。
+ */
