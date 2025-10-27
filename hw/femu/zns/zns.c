@@ -30,11 +30,21 @@ static inline uint32_t zns_zone_idx(NvmeNamespace *ns, uint64_t slba)
 
 static inline NvmeZone *zns_get_zone_by_slba(NvmeNamespace *ns, uint64_t slba)
 {
-    FemuCtrl *n = ns->ctrl;
-    uint32_t zone_idx = zns_zone_idx(ns, slba);
+    // FemuCtrl *n = ns->ctrl;
+    // uint32_t zone_idx = zns_zone_idx(ns, slba);
 
-    assert(zone_idx < n->num_zones);
-    return &n->zone_array[zone_idx];
+    // assert(zone_idx < n->num_zones);
+    // return &n->zone_array[zone_idx];
+    // 1. 从SLBA计算出逻辑Zone的索引
+    uint32_t logical_zone_idx = zns_zone_idx(ns, slba);
+    assert(logical_zone_idx < n->num_zones);
+
+    // 2. 使用映射表找到对应的物理Zone索引
+    uint32_t physical_zone_idx = n->zns->logical_to_physical_zone_map[logical_zone_idx];
+    assert(physical_zone_idx < n->num_zones);
+
+    // 3. 返回物理Zone数组中对应的结构
+    return &n->zone_array[physical_zone_idx];
 }
 
 /*
@@ -116,9 +126,21 @@ static void zns_init_zoned_state(NvmeNamespace *ns)
     NvmeZone *zone;
     int i;
 
+    //分配物理zone数组
     n->zone_array = g_new0(NvmeZone, n->num_zones);
     if (n->zd_extension_size) {
         n->zd_extensions = g_malloc0(n->zd_extension_size * n->num_zones);
+    }
+
+    /*
+     * 新增：分配并初始化逻辑到物理Zone的映射表。
+     * 初始状态下，逻辑Zone i 指向 物理Zone i。
+     * Added: Allocate and initialize the logical-to-physical zone map.
+     * Initially, logical zone i maps to physical zone i.
+    */
+    n->zns->logical_to_physical_zone_map = g_new0(uint32_t, n->num_zones);
+    for (i = 0; i < n->num_zones; i++) {
+        n->zns->logical_to_physical_zone_map[i] = i;
     }
 
     QTAILQ_INIT(&n->exp_open_zones);
@@ -607,7 +629,11 @@ struct zns_zone_reset_ctx {
 static void zns_aio_zone_reset_cb(NvmeRequest *req, NvmeZone *zone)
 {
     NvmeNamespace *ns = req->ns;
-
+    /*
+     * 新增：每次物理Zone被重置时，增加其重置计数器。
+     * Added: Increment the reset counter each time a physical zone is reset.
+    */
+    zone->reset_count++;
     /* FIXME, We always assume reset SUCCESS */
     switch (zns_get_zone_state(zone)) {
     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
@@ -1177,7 +1203,8 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
     /* cdw12 is zero-based number of dwords to return. Convert to bytes */
     uint32_t data_size = (le32_to_cpu(cmd->cdw12) + 1) << 2;
     uint32_t dw13 = le32_to_cpu(cmd->cdw13);
-    uint32_t zone_idx, zra, zrasf, partial;
+    uint32_t logical_zone_idx, zra, zrasf, partial; // 注意：这里是逻辑索引 Note: this is the logical index
+    // uint32_t zone_idx, zra, zrasf, partial;
     uint64_t max_zones, nr_zones = 0;
     uint16_t status;
     uint64_t slba, capacity = zns_ns_nlbas(ns);
@@ -1189,7 +1216,9 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
 
     req->status = NVME_SUCCESS;
 
-    status = zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &zone_idx);
+    // zns_get_mgmt_zone_slba_idx 返回的是逻辑Zone索引
+    // zns_get_mgmt_zone_slba_idx returns the logical zone index
+    status = zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &logical_zone_idx);
     if (status) {
         return status;
     }
@@ -1225,20 +1254,77 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
 
     max_zones = (data_size - sizeof(NvmeZoneReportHeader)) / zone_entry_sz;
     buf = g_malloc0(data_size);
-
-    zone = &n->zone_array[zone_idx];
-    for (; slba < capacity; slba += n->zone_size) {
-        if (partial && nr_zones >= max_zones) {
+    
+    // 新增
+    // 循环计算符合条件的逻辑Zone数量
+    for (uint32_t i = logical_zone_idx; i < n->num_zones; i++) {
+        if(partial && nr_zones >= max_zones) {
             break;
         }
-        if (zns_zone_matches_filter(zrasf, zone++)) {
+        // 通过映射获取真实的物理Zone
+        uint32_t physical_zone_idx = n->zns->logical_to_physical_zone_map[i];
+        NvmeZone *physical_zone = &n->zone_array[physical_zone_idx];
+        if (zns_zone_matches_filter(zrasf, physical_zone)) {
             nr_zones++;
         }
     }
+
+
+
+
+    // zone = &n->zone_array[zone_idx];
+    // for (; slba < capacity; slba += n->zone_size) {
+    //     if (partial && nr_zones >= max_zones) {
+    //         break;
+    //     }
+    //     if (zns_zone_matches_filter(zrasf, zone++)) {
+    //         nr_zones++;
+    //     }
+    // }
     header = (NvmeZoneReportHeader *)buf;
     header->nr_zones = cpu_to_le64(nr_zones);
 
     buf_p = buf + sizeof(NvmeZoneReportHeader);
+
+    // 循环填充报告
+    for (uint32_t i = logical_zone_idx; i < n->num_zones && max_zones > 0; i++) {
+        uint32_t physical_zone_idx = n->zns->logical_to_physical_zone_map[i];
+        NvmeZone *physical_zone = &n->zone_array[physical_zone_idx];
+
+        if (zns_zone_matches_filter(zrasf, physical_zone)) {
+            z = (NvmeZoneDescr *)buf_p;
+            buf_p += sizeof(NvmeZoneDescr);
+
+            z->zt = physical_zone->d.zt;
+            z->zs = physical_zone->d.zs;
+            z->zcap = cpu_to_le64(physical_zone->d.zcap);
+            /*
+             * 关键：报告给主机的zslba必须是逻辑Zone的zslba！
+             * 逻辑Zone i 的zslba就是 i * zone_size。
+             * CRITICAL: The zslba reported to the host MUST be the logical zone's zslba!
+             * The zslba for logical zone i is simply i * zone_size.
+            */
+            z->zslba = cpu_to_le64((uint64_t)i * n->zone_size);
+            z->za = physical_zone->d.za;
+
+            if (zns_wp_is_valid(physical_zone)) {
+                z->wp = cpu_to_le64(physical_zone->d.wp);
+            } else {
+                z->wp = cpu_to_le64(~0ULL);
+            }
+
+            if (zra == NVME_ZONE_REPORT_EXTENDED) {
+                if (physical_zone->d.za & NVME_ZA_ZD_EXT_VALID) {
+                    memcpy(buf_p, zns_get_zd_extension(ns, physical_zone_idx), n->zd_extension_size);
+                }
+                buf_p += n->zd_extension_size;
+            }
+
+            max_zones--;
+        }
+    }
+
+    /*
     for (; zone_idx < n->num_zones && max_zones > 0; zone_idx++) {
         zone = &n->zone_array[zone_idx];
         if (zns_zone_matches_filter(zrasf, zone)) {
@@ -1268,7 +1354,7 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
             max_zones--;
         }
     }
-
+    */
     status = dma_read_prp(n, (uint8_t *)buf, data_size, prp1, prp2);
 
     g_free(buf);
@@ -1388,6 +1474,7 @@ static void zns_init_params(FemuCtrl *n)
 {
     struct zns_ssd *id_zns;
     int i;
+    uint64_t rev_map_sz; // 新增：用于计算反向映射表大小 Added: for calculating reverse map size
 
     id_zns = g_malloc0(sizeof(struct zns_ssd));
     id_zns->num_ch = n->zns_params.zns_num_ch;
@@ -1398,13 +1485,27 @@ static void zns_init_params(FemuCtrl *n)
     id_zns->lbasz = 1 << zns_ns_lbads(&n->namespaces[0]);
     id_zns->flash_type = n->zns_params.zns_flash_type;
 
+    /*
+     * 新增：初始化超级设备(Super Device)数量。
+     * Added: Initialize the number of super devices.
+    */
+    id_zns->num_sd = 2; // 固定为2个超级设备 Fixed to 2 super devices
+
     id_zns->ch = g_malloc0(sizeof(struct zns_ch) * id_zns->num_ch);
     for (i =0; i < id_zns->num_ch; i++) {
         zns_init_ch(&id_zns->ch[i], id_zns->num_lun,id_zns->num_plane,id_zns->num_blk,id_zns->flash_type);
     }
+    /*
+     * 修改：为每个超级设备的写指针进行初始化。
+     * Modified: Initialize write pointers for each super device.
+    */
+    for (i = 0; i < id_zns->num_sd; i++) {
+        id_zns->wp[i].ch = i * (id_zns->num_ch / id_zns->num_sd); // 每个SD的起始通道 Each SD's starting channel
+        id_zns->wp[i].lun = 0;
+    }
 
-    id_zns->wp.ch = 0;
-    id_zns->wp.lun = 0;
+    // id_zns->wp.ch = 0;
+    // id_zns->wp.lun = 0;
 
     //Misao: init mapping table
     id_zns->l2p_sz = n->ns_size/LOGICAL_PAGE_SIZE;
@@ -1413,22 +1514,41 @@ static void zns_init_params(FemuCtrl *n)
         id_zns->maptbl[i].ppa = UNMAPPED_PPA;
     }
 
-    //Misao: init sram
-    id_zns->program_unit = ZNS_PAGE_SIZE*id_zns->flash_type*2; //PAGE_SIZE*flash_type*2 planes
-    id_zns->stripe_unit = id_zns->program_unit*id_zns->num_ch*id_zns->num_lun;
-    id_zns->cache.num_wc = ZNS_DEFAULT_NUM_WRITE_CACHE;
-    id_zns->cache.write_cache = g_malloc0(sizeof(struct zns_write_cache) * id_zns->cache.num_wc);
-    for(i =0; i < id_zns->cache.num_wc; i++)
-    {
-        id_zns->cache.write_cache[i].sblk = i;
-        id_zns->cache.write_cache[i].used = 0;
-        id_zns->cache.write_cache[i].cap = (id_zns->stripe_unit/LOGICAL_PAGE_SIZE);
-        id_zns->cache.write_cache[i].lpns = g_malloc0(sizeof(uint64_t) * id_zns->cache.write_cache[i].cap);
+
+    /*
+     * 新增：初始化PPA->LPN反向映射表。
+     * 表的大小由物理地址空间决定，所有条目初始化为无效LPN。
+     * Added: Initialize the PPA->LPN reverse mapping table.
+     * The table size is determined by the physical address space, and all entries are initialized to an invalid LPN.
+    */
+    rev_map_sz = id_zns->num_ch * id_zns->num_lun * id_zns->num_plane * \
+                 id_zns->num_blk * id_zns->num_page * (ZNS_PAGE_SIZE / LOGICAL_PAGE_SIZE);
+    id_zns->rev_maptbl = g_malloc0(sizeof(uint64_t) * rev_map_sz);
+    for (i = 0; i < rev_map_sz; i++) {
+        id_zns->rev_maptbl[i] = INVALID_LPN;
     }
+    
+    /*
+     * 根据用户要求，移除SRAM写缓冲区相关的初始化代码。
+     * Removed SRAM write buffer initialization code as per user request.
+    */
+    // //Misao: init sram
+    // id_zns->program_unit = ZNS_PAGE_SIZE*id_zns->flash_type*2; //PAGE_SIZE*flash_type*2 planes
+    // id_zns->stripe_unit = id_zns->program_unit*id_zns->num_ch*id_zns->num_lun;
+    // id_zns->cache.num_wc = ZNS_DEFAULT_NUM_WRITE_CACHE;
+    // id_zns->cache.write_cache = g_malloc0(sizeof(struct zns_write_cache) * id_zns->cache.num_wc);
+    // for(i =0; i < id_zns->cache.num_wc; i++)
+    // {
+    //     id_zns->cache.write_cache[i].sblk = i;
+    //     id_zns->cache.write_cache[i].used = 0;
+    //     id_zns->cache.write_cache[i].cap = (id_zns->stripe_unit/LOGICAL_PAGE_SIZE);
+    //     id_zns->cache.write_cache[i].lpns = g_malloc0(sizeof(uint64_t) * id_zns->cache.write_cache[i].cap);
+    // }
 
     femu_log("===========================================\n");
     femu_log("|        ZMS HW Configuration()           |\n");      
     femu_log("===========================================\n");
+    femu_log("|\t# Super Devices\t: %u\t\t|\n", id_zns->num_sd); // 新增日志输出 Added log output
     femu_log("|\tnchnl\t: %lu\t|\tchips per chnl\t: %lu\t|\tplanes per chip\t: %lu\t|\tblks per plane\t: %lu\t|\tpages per blk\t: %lu\t|\n",id_zns->num_ch,id_zns->num_lun,id_zns->num_plane,id_zns->num_blk,id_zns->num_page);
     //femu_log("|\tl2p sz\t: %lu\t|\tl2p cache sz\t: %u\t|\n",id_zns->l2p_sz,id_zns->cache.num_l2p_ent);
     femu_log("|\tprogram unit\t: %lu KiB\t|\tstripe unit\t: %lu KiB\t|\t# of write caches\t: %u\t|\t size of write caches (4KiB)\t: %lu\t|\n",id_zns->program_unit/(KiB),id_zns->stripe_unit/(KiB),id_zns->cache.num_wc,(id_zns->stripe_unit/LOGICAL_PAGE_SIZE));

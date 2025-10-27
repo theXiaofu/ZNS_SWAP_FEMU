@@ -166,22 +166,22 @@ typedef struct SSDNandFlashTiming {
  * 单位为纳秒，FTL/模拟层会基于这些值计算请求延迟。
  */
 
-struct zns_write_cache{
-    uint64_t sblk; //idx of corresponding superblock
-    uint64_t used; 
-    uint64_t cap;
-    uint64_t* lpns; //identify the cached data
-};
+// struct zns_write_cache{
+//     uint64_t sblk; //idx of corresponding superblock
+//     uint64_t used; 
+//     uint64_t cap;
+//     uint64_t* lpns; //identify the cached data
+// };
 
 /*
  * zns_write_cache
  * 简单的写缓存结构：记录所属超级块索引、已用条目数、容量以及保存的 LPN 列表。
  */
 
-struct zns_sram{
-    int num_wc;
-    struct zns_write_cache* write_cache;
-};
+// struct zns_sram{
+//     int num_wc;
+//     struct zns_write_cache* write_cache;
+// };
 
 /*
  * zns_sram
@@ -195,18 +195,35 @@ struct zns_ssd {
     uint64_t num_blk;
     uint64_t num_page;
 
+    // 超级设备(Super Device)的数量
+    uint32_t num_sd;
+
     struct zns_ch *ch;
-    struct write_pointer wp;
+    // 为每个超级设备维护一个独立的写指针
+    struct write_pointer wp[2];
 
     SSDNandFlashTiming timing; /*Misao: accurate  timing emulation for zns ssd.*/
     int flash_type;
     uint64_t program_unit;
     uint64_t stripe_unit;
-    struct zns_sram cache;
+    // struct zns_sram cache;
 
     /*Misao: we still need a ftl in consumer devices*/
     uint64_t l2p_sz; /* = # of 4KiB pages*/
     struct ppa *maptbl; /* (page - chunk - block) hybrid L2P mapping table */
+
+    // PPA -> LPN 反向映射表
+    uint64_t *rev_maptbl;
+
+    /*
+     * 新增：逻辑Zone到物理Zone的映射表。
+     * 数组索引是逻辑Zone的ID，值为其对应的物理Zone的ID。
+     * 这是实现对上层透明的关键。
+     * Added: Mapping table from logical zones to physical zones.
+     * The array index is the logical zone ID, and the value is the corresponding physical zone ID.
+     * This is key to achieving transparency for the host.
+    */
+    uint32_t *logical_to_physical_zone_map;
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
@@ -314,6 +331,8 @@ typedef struct NvmeZone {
     NvmeZoneDescr   d;
     uint64_t        w_ptr;
     QTAILQ_ENTRY(NvmeZone) entry;
+    // Zone重置计数器
+    uint32_t        reset_count;
 } NvmeZone;
 
 typedef struct NvmeNamespaceParams {
