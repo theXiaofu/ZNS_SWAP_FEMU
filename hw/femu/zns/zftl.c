@@ -586,131 +586,241 @@ static uint64_t zns_write(struct zns_ssd *zns, NvmeRequest *req)
 
 // 202501-10 修改到这里
 
+
+
+
 /*
- * 最终合并版：zns_move_zone_data 函数。
- * 实现专利思想的核心：将一个逻辑Zone的数据，从一个物理Zone（源）拷贝到另一个物理Zone（目标），
- * 然后更新逻辑Zone的映射，使其指向新的物理Zone，最后重置旧的物理Zone。
- * Final Merged Version: zns_move_zone_data function.
- * Implements the core idea of the patent: copies the data of a logical zone from a source physical zone to a destination physical zone,
- * then updates the logical zone's mapping to point to the new physical zone, and finally resets the old physical zone.
+ * 新增：流水线模式的数据迁移函数。
+ * 逐个逻辑页进行读后写操作，延迟逐步累加。
+ * Added: Pipelined data migration function.
+ * Performs read-then-write operations logical page by logical page, accumulating latency step-by-step.
 */
-static uint64_t zns_move_zone_data(FemuCtrl *n, uint32_t logical_src_idx, uint32_t physical_dst_idx)
+static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_idx, uint32_t physical_dst_idx)
 {
     struct zns_ssd *zns = n->zns;
-    // 获取源逻辑Zone当前映射的物理Zone索引
     uint32_t physical_src_idx = zns->logical_to_physical_zone_map[logical_src_idx];
-    // 获取源和目标物理Zone的结构指针
     NvmeZone *physical_src_zone = &n->zone_array[physical_src_idx];
     NvmeZone *physical_dst_zone = &n->zone_array[physical_dst_idx];
 
-    // 检查目标物理Zone是否为空，如果不是，则不能作为迁移目标
+    // 检查目标物理Zone是否为空
     if (zns_get_zone_state(physical_dst_zone) != NVME_ZONE_STATE_EMPTY) {
-        ftl_err("Move target physical zone %u is not empty!\n", physical_dst_idx);
-        return 0; // 返回0表示迁移失败或未执行
+        ftl_err("Pipelined Move: Target physical zone %u is not empty!\n", physical_dst_idx);
+        return 0;
     }
 
-    // 计算源逻辑Zone的LPN范围和有效数据量
+    // 计算LPN范围和数量
     uint64_t secs_per_pg = LOGICAL_PAGE_SIZE / zns->lbasz;
     uint64_t start_lpn = (uint64_t)logical_src_idx * n->zone_size / secs_per_pg;
-    // 计算有效数据的LBA数量，而非物理Zone的w_ptr
     uint64_t valid_lba_count = physical_src_zone->d.wp - physical_src_zone->d.zslba;
     uint64_t num_lpns = valid_lba_count / secs_per_pg;
-    // 如果有不足一页的数据，也算一页
-    if (valid_lba_count % secs_per_pg != 0) {
-        num_lpns++;
-    }
+    if (valid_lba_count % secs_per_pg != 0) num_lpns++;
 
-    uint64_t max_read_lat = 0, max_write_lat = 0;
-    uint64_t current_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint64_t accumulated_latency = 0; // 累积延迟
+    uint64_t current_op_start_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME); // 当前操作的开始时间
 
-    ftl_log("Start moving data for logical zone %u (from physical %u to %u), LPNs: %lu\n",
+    ftl_log("Start pipelined moving data for logical zone %u (phy %u -> %u), LPNs: %lu\n",
             logical_src_idx, physical_src_idx, physical_dst_idx, num_lpns);
 
-    // 1. 读取阶段：从源物理Zone读取所有有效数据，并记录最大延迟
-    // 1. Read Phase: Read all valid data from the source physical zone and record max latency
-    for (uint64_t i = 0; i < num_lpns; i++) {
-        struct ppa ppa = get_maptbl_ent(zns, start_lpn + i);
-        // 只读取已映射的有效数据页
-        // Only read mapped valid data pages
-        if (mapped_ppa(&ppa) && ppa.g.blk == physical_src_idx) { // 确保PPA确实指向源物理块
-            struct nand_cmd srd = { .cmd = NAND_READ, .type = GC_IO, .stime = current_time };
-            uint64_t sublat = zns_advance_status(zns, &ppa, &srd);
-            max_read_lat = (sublat > max_read_lat) ? sublat : max_read_lat;
-        }
-    }
-
-    // 2. 写入阶段：在读取完成后，将数据写入目标物理Zone
-    // 2. Write Phase: After reading is complete, write data to the destination physical zone
-    uint64_t write_start_time = current_time + max_read_lat;
     // 确定目标物理Zone所属的超级设备
     int dst_sd_idx = physical_dst_idx % zns->num_sd;
-    // FTL写操作的目标是逻辑Zone，保持不变
+    // FTL写操作的目标是逻辑Zone
     zns->active_zone = logical_src_idx;
-
-    // 临时更新映射，让get_new_page/zns_write能够正确地将数据写入目标物理Zone
-    // Temporarily update the mapping so get_new_page/zns_write write data to the target physical zone correctly
+    // 临时更新映射，让get_new_page指向目标物理Zone
     zns->logical_to_physical_zone_map[logical_src_idx] = physical_dst_idx;
 
-    uint64_t lpn_offset = 0;
-    while (lpn_offset < num_lpns) {
-        for(int p = 0; p < zns->num_plane; p++) {
-            struct ppa ppa = get_new_page(zns, n);
-            if (ppa.ppa == UNMAPPED_PPA) {
-                 ftl_err("Failed to get new page during migration write for LPN %lu\n", start_lpn + lpn_offset);
-                 // 错误处理：恢复映射？
-                 zns->logical_to_physical_zone_map[logical_src_idx] = physical_src_idx; // 恢复映射
-                 return 0; // 迁移失败
-            }
-            ppa.g.pl = p;
-            for(int j = 0; j < zns->flash_type ;j++) {
-                // 确保blk指向目标物理Zone
-                ppa.g.blk = physical_dst_idx;
-                ppa.g.pg = get_blk(zns,&ppa)->page_wp;
-                for(int subpage = 0; subpage < ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE; subpage++) {
-                    if (lpn_offset >= num_lpns) break;
-                    ppa.g.spg = subpage;
-                    // 更新映射表，将LPN指向新的PPA（位于目标物理Zone）
-                    set_maptbl_ent(zns, start_lpn + lpn_offset, &ppa);
-                    lpn_offset++;
-                }
-                // 确保blk指向目标物理Zone
-                ppa.g.blk = physical_dst_idx;
-                get_blk(zns,&ppa)->page_wp++;
-                if (lpn_offset >= num_lpns) break;
-            }
-            struct nand_cmd swr = { .cmd = NAND_WRITE, .type = GC_IO, .stime = write_start_time };
-            // 确保blk指向目标物理Zone
-            ppa.g.blk = physical_dst_idx;
-            uint64_t sublat = zns_advance_status(zns, &ppa, &swr);
-            max_write_lat = (sublat > max_write_lat) ? sublat : max_write_lat;
-            if (lpn_offset >= num_lpns) break;
+    // 逐个LPN处理
+    for (uint64_t i = 0; i < num_lpns; i++) {
+        uint64_t lpn = start_lpn + i;
+        struct ppa read_ppa = get_maptbl_ent(zns, lpn); // 注意：这里获取的是旧映射
+        uint64_t read_lat = 0;
+        uint64_t write_lat = 0;
+
+        // 1. 读取当前LPN
+        if (mapped_ppa(&read_ppa) && read_ppa.g.blk == physical_src_idx) {
+            struct nand_cmd srd = { .cmd = NAND_READ, .type = GC_IO, .stime = current_op_start_time };
+            read_lat = zns_advance_status(zns, &read_ppa, &srd);
         }
-        // 推进目标物理Zone所在SD的写指针
-        zns_advance_write_pointer(zns, n); // advance_write_pointer内部会根据active_zone找到正确的SD
+
+        // 2. 获取写入位置 (这里简化处理，假设每个LPN写入都需要获取新页并推进指针，实际可能更复杂)
+        // 注意：get_new_page现在会返回目标物理Zone的PPA
+        struct ppa write_ppa = get_new_page(zns, n);
+        if (write_ppa.ppa == UNMAPPED_PPA) {
+            ftl_err("Pipelined Move: Failed to get new page for LPN %lu\n", lpn);
+            zns->logical_to_physical_zone_map[logical_src_idx] = physical_src_idx; // 恢复映射
+            return 0; // 失败
+        }
+        // 需要手动设置 subpage 和 plane (简化：假设每次都写到第0个subpage和第0个plane，这不完全准确)
+        write_ppa.g.spg = 0; // 简化假设
+        write_ppa.g.pl = 0;  // 简化假设
+        write_ppa.g.pg = get_blk(zns,&write_ppa)->page_wp; // 获取页号
+        get_blk(zns,&write_ppa)->page_wp++; // 更新页写入指针 (简化假设)
+
+        // 更新映射表指向新位置
+        set_maptbl_ent(zns, lpn, &write_ppa);
+
+        // 3. 写入当前LPN (写入开始时间是读取完成后)
+        uint64_t write_start_time_for_lpn = current_op_start_time + read_lat;
+        struct nand_cmd swr = { .cmd = NAND_WRITE, .type = GC_IO, .stime = write_start_time_for_lpn };
+        write_lat = zns_advance_status(zns, &write_ppa, &swr);
+
+        // 4. 更新下一个操作的开始时间
+        current_op_start_time += (read_lat + write_lat);
+        accumulated_latency += (read_lat + write_lat);
+
+        // 5. 推进写指针 (简化：每个LPN都推进一次，实际应按物理页)
+        zns_advance_write_pointer(zns, n);
     }
 
-    // 3. 更新目标物理Zone的元数据
-    // 3. Update destination physical zone's metadata
-    physical_dst_zone->w_ptr = physical_dst_zone->d.zslba + (lpn_offset * secs_per_pg); // 使用实际写入的lpn数量
+    // 恢复active_zone或设置为一个安全值 (可选)
+    // zns->active_zone = -1; // Or some default
+
+    // 更新目标物理Zone的元数据
+    physical_dst_zone->w_ptr = physical_dst_zone->d.zslba + (num_lpns * secs_per_pg); // 使用实际写入的lpn数量
     physical_dst_zone->d.wp = physical_dst_zone->w_ptr;
     physical_dst_zone->reset_count = physical_src_zone->reset_count; // 继承reset_count
-
-    // 根据写入数据量，精确更新状态
-    // Update state accurately based on the amount of data written
     if (physical_dst_zone->w_ptr >= zns_zone_wr_boundary(physical_dst_zone)) {
         zns_assign_zone_state(n->namespaces, physical_dst_zone, NVME_ZONE_STATE_FULL);
     } else {
         zns_assign_zone_state(n->namespaces, physical_dst_zone, NVME_ZONE_STATE_CLOSED);
     }
 
-    // 4. 重置源物理Zone (旧的物理Zone)
-    // 4. Reset the source physical zone (the old one)
-    NvmeRequest fake_req = { .ns = n->namespaces }; // 需要传递ns指针
+    // 重置源物理Zone
+    NvmeRequest fake_req = { .ns = n->namespaces };
     zns_aio_zone_reset_cb(&fake_req, physical_src_zone);
 
-    ftl_log("Finished moving data. Total latency estimate: %lu ns\n", max_read_lat + max_write_lat);
+    ftl_log("Finished pipelined moving data. Total accumulated latency: %lu ns\n", accumulated_latency);
+    return accumulated_latency;
+}
+
+
+/*
+ * 新增：批处理模式的数据迁移函数。
+ * 先完成所有读操作，记录最大读延迟；然后基于此开始所有写操作，记录最大写延迟。
+ * Added: Batched (non-pipelined) data migration function.
+ * Completes all reads first, records max read latency; then starts all writes based on that, records max write latency.
+*/
+static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx, uint32_t physical_dst_idx)
+{
+    struct zns_ssd *zns = n->zns;
+    uint32_t physical_src_idx = zns->logical_to_physical_zone_map[logical_src_idx];
+    NvmeZone *physical_src_zone = &n->zone_array[physical_src_idx];
+    NvmeZone *physical_dst_zone = &n->zone_array[physical_dst_idx];
+
+    // 检查目标物理Zone是否为空
+    if (zns_get_zone_state(physical_dst_zone) != NVME_ZONE_STATE_EMPTY) {
+        ftl_err("Batched Move: Target physical zone %u is not empty!\n", physical_dst_idx);
+        return 0;
+    }
+
+    // 计算LPN范围和数量
+    uint64_t secs_per_pg = LOGICAL_PAGE_SIZE / zns->lbasz;
+    uint64_t start_lpn = (uint64_t)logical_src_idx * n->zone_size / secs_per_pg;
+    uint64_t valid_lba_count = physical_src_zone->d.wp - physical_src_zone->d.zslba;
+    uint64_t num_lpns = valid_lba_count / secs_per_pg;
+    if (valid_lba_count % secs_per_pg != 0) num_lpns++;
+
+    uint64_t max_read_lat = 0, max_write_lat = 0;
+    uint64_t current_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    ftl_log("Start batched moving data for logical zone %u (phy %u -> %u), LPNs: %lu\n",
+            logical_src_idx, physical_src_idx, physical_dst_idx, num_lpns);
+
+    // 1. 读取阶段：模拟读取所有LPN，找出最大延迟
+    // 1. Read Phase: Simulate reading all LPNs, find the maximum latency
+    for (uint64_t i = 0; i < num_lpns; i++) {
+        struct ppa ppa = get_maptbl_ent(zns, start_lpn + i);
+        // 读取旧映射中的有效数据
+        if (mapped_ppa(&ppa) && ppa.g.blk == physical_src_idx) {
+            // 所有读取操作假设同时开始
+            struct nand_cmd srd = { .cmd = NAND_READ, .type = GC_IO, .stime = current_time };
+            uint64_t sublat = zns_advance_status(zns, &ppa, &srd);
+            max_read_lat = (sublat > max_read_lat) ? sublat : max_read_lat;
+        }
+    }
+
+    // 2. 写入阶段：使用类似zns_write的批处理逻辑写入所有LPN
+    // 2. Write Phase: Use batch processing logic similar to zns_write to write all LPNs
+    uint64_t write_start_time = current_time + max_read_lat;
+    // 确定目标物理Zone所属的超级设备
+    int dst_sd_idx = physical_dst_idx % zns->num_sd;
+    // FTL写操作的目标是逻辑Zone
+    zns->active_zone = logical_src_idx;
+    // 临时更新映射，让get_new_page指向目标物理Zone
+    zns->logical_to_physical_zone_map[logical_src_idx] = physical_dst_idx;
+
+    uint64_t lpn_offset = 0;
+    while (lpn_offset < num_lpns)
+    {
+        // 模拟跨所有plane的并行写入
+        for(int p = 0; p < zns->num_plane; p++)
+        {
+            // 获取一个PPA基地址，注意blk号应是目标物理Zone
+            struct ppa ppa = get_new_page(zns, n);
+            if (ppa.ppa == UNMAPPED_PPA) {
+                ftl_err("Batched Move: Failed to get new page for LPN offset %lu\n", lpn_offset);
+                 zns->logical_to_physical_zone_map[logical_src_idx] = physical_src_idx; // 恢复映射
+                 return 0; // 失败
+            }
+            ppa.g.pl = p; // 设置plane号
+            ppa.g.blk = physical_dst_idx; // 确保blk是目标物理Zone
+
+            // 模拟多level cell技术和填充物理页
+            for(int j = 0; j < zns->flash_type ;j++)
+            {
+                ppa.g.pg = get_blk(zns,&ppa)->page_wp; // 获取当前页号
+                for(int subpage = 0; subpage < ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE; subpage++)
+                {
+                    if (lpn_offset >= num_lpns) break; // 所有LPN处理完毕
+                    uint64_t lpn = start_lpn + lpn_offset;
+                    ppa.g.spg = subpage;
+                    // 更新映射表，将LPN指向新的PPA（位于目标物理Zone）
+                    set_maptbl_ent(zns, lpn, &ppa);
+                    lpn_offset++;
+                }
+                // 更新目标物理Zone的页写入指针
+                get_blk(zns,&ppa)->page_wp++;
+                if (lpn_offset >= num_lpns) break;
+            }
+
+            // 如果这个物理页确实写入了数据 (lpn_offset 在循环中增加了)
+            if (ppa.g.V) // 或者检查 lpn_offset 是否真的移动了
+            {
+                // 发出一个NAND写命令并计算延迟，所有写入操作假设同时开始
+                struct nand_cmd swr = { .cmd = NAND_WRITE, .type = GC_IO, .stime = write_start_time };
+                uint64_t sublat = zns_advance_status(zns, &ppa, &swr);
+                max_write_lat = (sublat > max_write_lat) ? sublat : max_write_lat;
+            }
+
+            if (lpn_offset >= num_lpns) break; // 如果所有LPN已处理，跳出plane循环
+        }
+        // 在完成一次跨所有plane的写入后，推进目标物理Zone所在SD的写指针
+        zns_advance_write_pointer(zns, n);
+    }
+
+    // 恢复active_zone或设置为一个安全值 (可选)
+    // zns->active_zone = -1; // Or some default
+
+    // 3. 更新目标物理Zone的元数据
+    physical_dst_zone->w_ptr = physical_dst_zone->d.zslba + (lpn_offset * secs_per_pg); // 使用实际写入的lpn数量
+    physical_dst_zone->d.wp = physical_dst_zone->w_ptr;
+    physical_dst_zone->reset_count = physical_src_zone->reset_count; // 继承reset_count
+    if (physical_dst_zone->w_ptr >= zns_zone_wr_boundary(physical_dst_zone)) {
+        zns_assign_zone_state(n->namespaces, physical_dst_zone, NVME_ZONE_STATE_FULL);
+    } else {
+        zns_assign_zone_state(n->namespaces, physical_dst_zone, NVME_ZONE_STATE_CLOSED);
+    }
+
+    // 4. 重置源物理Zone
+    NvmeRequest fake_req = { .ns = n->namespaces };
+    zns_aio_zone_reset_cb(&fake_req, physical_src_zone);
+
+    ftl_log("Finished batched moving data. Total latency estimate: %lu ns (max_read %lu + max_write %lu)\n",
+            max_read_lat + max_write_lat, max_read_lat, max_write_lat);
     return max_read_lat + max_write_lat;
 }
+
+
+
 
 
 /*
