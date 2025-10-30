@@ -332,6 +332,7 @@ static struct ppa get_new_page(struct zns_ssd *zns, FemuCtrl *n)
     ppa.g.V = 1;
     if(!valid_ppa(zns, &ppa)) {
         ftl_err("[Misao] invalid ppa generated: ch %u lun %u pl %u blk %u pg %u spg %u\n", ppa.g.ch, ppa.g.fc, ppa.g.pl, ppa.g.blk, ppa.g.pg, ppa.g.spg);
+        printf("[Misao] invalid ppa generated: ch %u lun %u pl %u blk %u pg %u spg %u\n", ppa.g.ch, ppa.g.fc, ppa.g.pl, ppa.g.blk, ppa.g.pg, ppa.g.spg);
         ppa.ppa = UNMAPPED_PPA;
     }
     return ppa;
@@ -806,7 +807,9 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
 
     // 临时更新映射
     zns->logical_to_physical_zone_map[logical_src_idx] = physical_dst_idx;
-    // zns->active_zone = logical_src_idx; 我仅仅是更新映射，感觉不需要更新active_zone
+
+    uint32_t source_active_zone = zns->active_zone; // 保存当前活动逻辑Zone索引
+    zns->active_zone = logical_src_idx; // 我仅仅是更新映射，感觉不需要更新active_zone
 
     // 2. 写入阶段
     uint64_t processed_valid_lpns = 0; // 已处理的有效LPN计数
@@ -820,6 +823,7 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
             if (ppa.ppa == UNMAPPED_PPA) {
                  ftl_err("Pipelined Move: Failed to get new page in write phase.\n");
                  zns->logical_to_physical_zone_map[logical_src_idx] = physical_src_idx; // 恢复映射
+                 zns->active_zone = source_active_zone; // 恢复活动逻辑Zone索引
                  return 0; // 失败
             }
             ppa.g.pl = p;
@@ -845,6 +849,7 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
                          lpns_in_this_page[lpn_count_this_page++] = start_lpn + current_check_idx;
                      } else {
                           ftl_err("Pipelined Move: Exceeded temp LPN array size for page write!\n");
+                          printf("Pipelined Move: Exceeded temp LPN array size for page write!\n");
                           // 可以在这里添加更详细的错误处理
                      }
                 }
@@ -922,7 +927,7 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
     physical_src_zone->d.wp = physical_src_zone->d.zslba;
     zns_assign_zone_state(ns, physical_src_zone, original_target_state); // Assign EMPTY state
     /* --- 元数据更新结束 --- */
-
+    zns->active_zone = source_active_zone; // 恢复活动逻辑Zone索引
     uint64_t total_latency = max_overall_finish_time > start_time ? max_overall_finish_time - start_time : 0;
     ftl_log("Finished pipelined v3 moving data. Total estimated latency: %lu ns\n", total_latency);
     return total_latency;
@@ -1013,6 +1018,7 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
 
     // 2. 写入阶段
     uint64_t write_start_time = current_time + max_read_lat;
+    uint32_t source_active_zone = zns->active_zone; // 保存当前活动逻辑Zone索引
     zns->active_zone = logical_src_idx;
     zns->logical_to_physical_zone_map[logical_src_idx] = physical_dst_idx;
 
@@ -1023,6 +1029,7 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
             if (ppa.ppa == UNMAPPED_PPA) {
                  ftl_err("Batched Move: Failed to get new page in write phase.\n");
                  zns->logical_to_physical_zone_map[logical_src_idx] = physical_src_idx; // 恢复映射
+                 zns->active_zone = source_active_zone; // 恢复活动逻辑Zone索引
                  return 0; // 失败
             }
             ppa.g.pl = p;
@@ -1084,6 +1091,7 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
      physical_src_zone->d.wp = physical_src_zone->d.zslba;
      zns_assign_zone_state(ns, physical_src_zone, original_target_state);
     /* --- 元数据更新结束 --- */
+    zns->active_zone = source_active_zone; // 恢复活动逻辑Zone索引
 
     ftl_log("Finished batched moving data. Total latency estimate: %lu ns (max_read %lu + max_write %lu)\n",
             max_read_lat + max_write_lat, max_read_lat, max_write_lat);
@@ -1160,7 +1168,9 @@ void zns_check_and_balance_super_devices(FemuCtrl *n)
                     logical_src_idx, sd_above_thresh, zns->logical_to_physical_zone_map[logical_src_idx],
                     physical_dst_idx, sd_below_thresh);
             /* 调用批处理模式进行迁移 */
-            zns_move_zone_data_batched(n, logical_src_idx, physical_dst_idx);
+            
+            uint64_t latency = zns_move_zone_data_batched(n, logical_src_idx, physical_dst_idx);
+            printf("Balancing completed with estimated latency: %lu ns\n", latency);
             /* 调用流水线模式进行迁移 */
             // zns_move_zone_data_pipelined(n, logical_src_idx, physical_dst_idx);
         } else {
