@@ -350,6 +350,7 @@ typedef struct NvmeNamespaceParams {
     struct zns_ssd *zns;
 } NvmeNamespaceParams;
 
+
 static inline uint32_t zns_nsid(NvmeNamespace *ns)
 {
     if (ns) {
@@ -461,4 +462,6 @@ static inline void zns_aor_dec_active(NvmeNamespace *ns)
 void zns_ns_shutdown(NvmeNamespace *ns);
 void zns_ns_cleanup(NvmeNamespace *ns);
 
+uint32_t zns_zone_idx(NvmeNamespace *ns, uint64_t slba);
+void zns_assign_zone_state(NvmeNamespace *ns, NvmeZone *zone, NvmeZoneState state);
 #endif

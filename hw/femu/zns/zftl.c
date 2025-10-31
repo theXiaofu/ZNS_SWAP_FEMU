@@ -61,6 +61,20 @@ static inline struct ppa get_maptbl_ent(struct zns_ssd *zns, uint64_t lpn)
 //     zns->maptbl[lpn] = *ppa;
 // }
 
+
+/*
+ * valid_ppa / mapped_ppa
+ * 校验 ppa 是否落在设备几何范围内，以及是否已被映射（判定为 UNMAPPED_PPA）。
+ */
+
+static inline bool mapped_ppa(struct ppa *ppa)
+{
+    return !(ppa->ppa == UNMAPPED_PPA);
+}
+
+
+
+
 /*
  * 修改：更新映射表条目时，同时更新反向映射表。
  * Modified: When updating a map table entry, also update the reverse map table.
@@ -263,16 +277,6 @@ static inline bool valid_ppa(struct zns_ssd *zns, struct ppa *ppa)
         return true;
 
     return false;
-}
-
-/*
- * valid_ppa / mapped_ppa
- * 校验 ppa 是否落在设备几何范围内，以及是否已被映射（判定为 UNMAPPED_PPA）。
- */
-
-static inline bool mapped_ppa(struct ppa *ppa)
-{
-    return !(ppa->ppa == UNMAPPED_PPA);
 }
 
 
@@ -702,6 +706,21 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
 }
 */
 
+/*
+ * 新增：辅助函数，用于获取NvmeZoneState的字符串表示 (用于日志)
+ */
+static const char* nvme_zone_state_str(NvmeZoneState state) {
+    switch (state) {
+        case NVME_ZONE_STATE_EMPTY: return "EMPTY";
+        case NVME_ZONE_STATE_IMPLICITLY_OPEN: return "IOPEN";
+        case NVME_ZONE_STATE_EXPLICITLY_OPEN: return "EOPEN";
+        case NVME_ZONE_STATE_CLOSED: return "CLOSED";
+        case NVME_ZONE_STATE_FULL: return "FULL";
+        case NVME_ZONE_STATE_READ_ONLY: return "RO";
+        case NVME_ZONE_STATE_OFFLINE: return "OFFLINE";
+        default: return "UNKNOWN";
+    }
+}
 
 
 
@@ -819,7 +838,7 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
     while (processed_valid_lpns < num_valid_lpns) {
         // 跨plane写入
         for (int p = 0; p < zns->num_plane; p++) {
-            struct ppa ppa = get_new_page(zns, n, logical_src_idx);
+            struct ppa ppa = get_new_page(zns, n);
             if (ppa.ppa == UNMAPPED_PPA) {
                  ftl_err("Pipelined Move: Failed to get new page in write phase.\n");
                  zns->logical_to_physical_zone_map[logical_src_idx] = physical_src_idx; // 恢复映射
@@ -829,10 +848,11 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
             ppa.g.pl = p;
             ppa.g.blk = physical_dst_idx;
 
-            bool page_written_in_plane = false;
+            // bool page_written_in_plane = false;
             uint64_t latest_read_finish_for_this_page = start_time;
             // 栈上分配是安全的，因为大小固定且不大
-            uint64_t lpns_in_this_page[zns->flash_type * lpns_per_phy_page];
+            // uint64_t lpns_in_this_page[zns->flash_type * lpns_per_phy_page];
+            uint64_t lpns_in_this_page[128]; // 假设最大128个LPN足够 本实验也只有16个
             uint64_t lpn_count_this_page = 0;
 
             // 确定本物理页包含的有效LPN及最晚读取时间
@@ -869,7 +889,7 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
                 }
 
                  get_blk(zns, &ppa)->page_wp++;
-                 page_written_in_plane = true;
+                //  page_written_in_plane = true;
 
                 // 计算写入延迟
                 struct nand_cmd swr = { .cmd = NAND_WRITE, .type = GC_IO, .stime = write_start_time_for_page };
@@ -888,7 +908,7 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
          current_lpn_idx_offset += zns->num_plane * zns->flash_type * lpns_per_phy_page;
 
         // 完成跨plane写入后推进写指针
-        zns_advance_write_pointer(zns, n, logical_src_idx);
+        zns_advance_write_pointer(zns, n);
 
         if (processed_valid_lpns >= num_valid_lpns) break;
         if (current_lpn_idx_offset >= num_lpns_in_zone) break;
@@ -1025,7 +1045,7 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
     uint64_t lpn_offset = 0; // 跟踪实际写入的有效 LPN 数量
     while (lpn_offset < num_valid_lpns) {
         for(int p = 0; p < zns->num_plane; p++) {
-            struct ppa ppa = get_new_page(zns, n, logical_src_idx);
+            struct ppa ppa = get_new_page(zns, n);
             if (ppa.ppa == UNMAPPED_PPA) {
                  ftl_err("Batched Move: Failed to get new page in write phase.\n");
                  zns->logical_to_physical_zone_map[logical_src_idx] = physical_src_idx; // 恢复映射
@@ -1060,7 +1080,7 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
             }
             if (lpn_offset >= num_valid_lpns) break;
         }
-        zns_advance_write_pointer(zns, n, logical_src_idx);
+        zns_advance_write_pointer(zns, n);
     }
 
     /* --- 更新目标和源物理Zone的元数据 (代码不变) --- */
@@ -1105,16 +1125,19 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
  * 最终版：zns_check_and_balance_super_devices 函数。
  * 查找超载SD上的逻辑冷Zone和轻载SD上的物理空Zone，调用批处理模式进行迁移。
  */
-void zns_check_and_balance_super_devices(FemuCtrl *n)
+static void zns_check_and_balance_super_devices(FemuCtrl *n)
 {
     struct zns_ssd *zns = n->zns;
+    bool use_batch = true; // 设置为使用批处理模式
     // 健壮性检查
     if (!zns || n->num_zones == 0 || zns->num_sd == 0) return;
     uint32_t zones_per_sd = n->num_zones / zns->num_sd;
+    
     // 如果每个SD的Zone数少于1，则无法均衡
     if (zones_per_sd == 0) return;
 
-    uint32_t cold_zone_counts[zns->num_sd];
+    // uint32_t cold_zone_counts[zns->num_sd];
+    uint32_t cold_zone_counts[2];//zns的超级设备数目固定为2
     int sd_above_thresh = -1, sd_below_thresh = -1;
 
     memset(cold_zone_counts, 0, sizeof(cold_zone_counts));
@@ -1169,10 +1192,14 @@ void zns_check_and_balance_super_devices(FemuCtrl *n)
                     physical_dst_idx, sd_below_thresh);
             /* 调用批处理模式进行迁移 */
             
-            uint64_t latency = zns_move_zone_data_batched(n, logical_src_idx, physical_dst_idx);
-            printf("Balancing completed with estimated latency: %lu ns\n", latency);
+            uint64_t latency; 
+            if(use_batch){
+            latency = zns_move_zone_data_batched(n, logical_src_idx, physical_dst_idx);
+            }else{
             /* 调用流水线模式进行迁移 */
-            // zns_move_zone_data_pipelined(n, logical_src_idx, physical_dst_idx);
+            zns_move_zone_data_pipelined(n, logical_src_idx, physical_dst_idx);
+            }
+            printf("Balancing completed with estimated latency: %lu ns\n", latency);
         } else {
              ftl_log("Balancing check: Could not find suitable source logical zone (%d) or destination physical zone (%d).\n",
                      logical_src_idx, physical_dst_idx);

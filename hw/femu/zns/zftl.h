@@ -26,6 +26,13 @@
  */
 void zftl_init(FemuCtrl *n);
 
+
+
+
+// static inline uint32_t zns_zone_idx(NvmeNamespace *ns, uint64_t slba);
+// static void zns_assign_zone_state(NvmeNamespace *ns, NvmeZone *zone, NvmeZoneState state);
+
+
 #ifdef FEMU_DEBUG_ZFTL
 #define ftl_debug(fmt, ...) \
     do { printf("[Misao] ZFTL-Dbg: " fmt, ## __VA_ARGS__); } while (0)

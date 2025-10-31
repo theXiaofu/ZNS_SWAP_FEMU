@@ -15,7 +15,7 @@
  * 注：本文件内仅添加注释以提高可读性，未修改任何功能性代码。
  */
 
-static inline uint32_t zns_zone_idx(NvmeNamespace *ns, uint64_t slba)
+inline uint32_t zns_zone_idx(NvmeNamespace *ns, uint64_t slba)
 {
     FemuCtrl *n = ns->ctrl;
 
@@ -30,7 +30,7 @@ static inline uint32_t zns_zone_idx(NvmeNamespace *ns, uint64_t slba)
 
 static inline NvmeZone *zns_get_zone_by_slba(NvmeNamespace *ns, uint64_t slba)
 {
-    // FemuCtrl *n = ns->ctrl;
+    FemuCtrl *n = ns->ctrl;
     // uint32_t zone_idx = zns_zone_idx(ns, slba);
 
     // assert(zone_idx < n->num_zones);
@@ -291,7 +291,7 @@ void zns_ns_cleanup(NvmeNamespace *ns)
     }
 }
 
-static void zns_assign_zone_state(NvmeNamespace *ns, NvmeZone *zone, NvmeZoneState state)
+void zns_assign_zone_state(NvmeNamespace *ns, NvmeZone *zone, NvmeZoneState state)
 {
     FemuCtrl *n = ns->ctrl;
 
@@ -1207,9 +1207,10 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
     // uint32_t zone_idx, zra, zrasf, partial;
     uint64_t max_zones, nr_zones = 0;
     uint16_t status;
-    uint64_t slba, capacity = zns_ns_nlbas(ns);
+    // uint64_t slba, capacity = zns_ns_nlbas(ns);
+    uint64_t slba;
     NvmeZoneDescr *z;
-    NvmeZone *zone;
+    // NvmeZone *zone;
     NvmeZoneReportHeader *header;
     void *buf, *buf_p;
     size_t zone_entry_sz;
@@ -1551,7 +1552,7 @@ static void zns_init_params(FemuCtrl *n)
     femu_log("|\t# Super Devices\t: %u\t\t|\n", id_zns->num_sd); // 新增日志输出 Added log output
     femu_log("|\tnchnl\t: %lu\t|\tchips per chnl\t: %lu\t|\tplanes per chip\t: %lu\t|\tblks per plane\t: %lu\t|\tpages per blk\t: %lu\t|\n",id_zns->num_ch,id_zns->num_lun,id_zns->num_plane,id_zns->num_blk,id_zns->num_page);
     //femu_log("|\tl2p sz\t: %lu\t|\tl2p cache sz\t: %u\t|\n",id_zns->l2p_sz,id_zns->cache.num_l2p_ent);
-    femu_log("|\tprogram unit\t: %lu KiB\t|\tstripe unit\t: %lu KiB\t|\t# of write caches\t: %u\t|\t size of write caches (4KiB)\t: %lu\t|\n",id_zns->program_unit/(KiB),id_zns->stripe_unit/(KiB),id_zns->cache.num_wc,(id_zns->stripe_unit/LOGICAL_PAGE_SIZE));
+    // femu_log("|\tprogram unit\t: %lu KiB\t|\tstripe unit\t: %lu KiB\t|\t# of write caches\t: %u\t|\t size of write caches (4KiB)\t: %lu\t|\n",id_zns->program_unit/(KiB),id_zns->stripe_unit/(KiB),id_zns->cache.num_wc,(id_zns->stripe_unit/LOGICAL_PAGE_SIZE));
     femu_log("===========================================\n"); 
 
     //Misao: use average read latency
