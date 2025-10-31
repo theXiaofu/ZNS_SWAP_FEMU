@@ -1197,7 +1197,7 @@ static bool zns_zone_matches_filter(uint32_t zafs, NvmeZone *zl)
 static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
 {
     NvmeCmd *cmd = (NvmeCmd *)&req->cmd;
-    NvmeNamespace *ns = req->ns;
+    // NvmeNamespace *ns = req->ns;
     uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
     uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
     /* cdw12 is zero-based number of dwords to return. Convert to bytes */
@@ -1314,11 +1314,41 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
                 z->wp = cpu_to_le64(~0ULL);
             }
 
+            printf("Report Zone idx %u (phys %u): zslba 0x%lx, wp 0x%lx, zs %u\n",
+                    i, physical_zone_idx,
+                    le64_to_cpu(z->zslba),
+                    le64_to_cpu(z->wp),
+                    z->zs);
+
+            // 1. 在主报告中设置 "扩展有效" 标志
+            z->za = physical_zone->d.za | NVME_ZA_ZD_EXT_VALID;
             if (zra == NVME_ZONE_REPORT_EXTENDED) {
-                if (physical_zone->d.za & NVME_ZA_ZD_EXT_VALID) {
-                    memcpy(buf_p, zns_get_zd_extension(ns, physical_zone_idx), n->zd_extension_size);
+                // 创建一个临时的扩展结构
+                FemuZoneExtension ext_data = {0};
+
+                // 填充 reset_count (来自 NvmeZone 结构)
+                ext_data.reset_count = cpu_to_le32(physical_zone->reset_count);
+
+                // 计算并填充 Super Device ID
+                // (基于物理索引 和 zns_ssd 结构中的 num_sd)
+                if (n->zns->num_sd > 0) {
+                    uint32_t sd_id = physical_zone_idx % n->zns->num_sd;
+                    ext_data.super_device_id = cpu_to_le32(sd_id);
                 }
+
+                // 将我们的自定义结构复制到返回缓冲区
+                memcpy(buf_p, &ext_data, n->zd_extension_size);
+
+                printf("  ZD Extension: reset_count %u, super_device_id %u\n",
+                       le32_to_cpu(ext_data.reset_count),
+                       le32_to_cpu(ext_data.super_device_id));
+
+                // 推进缓冲区指针
                 buf_p += n->zd_extension_size;
+                // if (physical_zone->d.za & NVME_ZA_ZD_EXT_VALID) {
+                //     memcpy(buf_p, zns_get_zd_extension(ns, physical_zone_idx), n->zd_extension_size);
+                // }
+                // buf_p += n->zd_extension_size;
             }
 
             max_zones--;
@@ -1595,8 +1625,9 @@ static int zns_init_zone_cap(FemuCtrl *n)
     n->cross_zone_read = false;
     n->max_active_zones = 0;
     n->max_open_zones = 0;
-    n->zd_extension_size = 0;
-
+    // n->zd_extension_size = 0;
+    n->zd_extension_size = sizeof(FemuZoneExtension); // 结果应为 64
+    
     return 0;
 }
 

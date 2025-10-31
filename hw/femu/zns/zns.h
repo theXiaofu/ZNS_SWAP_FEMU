@@ -283,6 +283,20 @@ enum NvmeZoneSendAction {
     NVME_ZONE_ACTION_OFFLINE         = 0x05,
     NVME_ZONE_ACTION_SET_ZD_EXT      = 0x10,
 };
+/*
+ * 新增：FEMU 自定义区域描述符扩展
+ * 用于在 report-zones --extended 命令中报告额外信息。
+ * 必须是 64 字节的倍数。
+ *
+ * Added: FEMU Custom Zone Descriptor Extension
+ * Used to report extra information in 'report-zones --extended'.
+ * Must be a multiple of 64 bytes.
+*/
+typedef struct FemuZoneExtension {
+    uint32_t reset_count;       /* 区域重置计数器 */
+    uint32_t super_device_id;   /* 所属的超级设备 ID */
+    uint8_t  rsvd[56];          /* 填充到 64 字节 */
+} FemuZoneExtension;
 
 typedef struct QEMU_PACKED NvmeZoneDescr {
     uint8_t     zt;
@@ -294,6 +308,7 @@ typedef struct QEMU_PACKED NvmeZoneDescr {
     uint64_t    wp;
     uint8_t     rsvd32[32];
 } NvmeZoneDescr;
+
 
 typedef enum NvmeZoneState {
     NVME_ZONE_STATE_RESERVED         = 0x00,
