@@ -985,7 +985,7 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
  * 先完成所有读操作，记录最大读延迟；然后基于此开始所有写操作，记录最大写延迟。
  * 状态处理同上。
  */
-static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx, uint32_t physical_dst_idx)
+static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx, uint32_t physical_dst_idx, uint64_t requested_start_time)
 {
     struct zns_ssd *zns = n->zns;
     NvmeNamespace *ns = n->namespaces;
@@ -1330,7 +1330,7 @@ static void zns_check_and_balance_super_devices(FemuCtrl *n)
 
         // 3c. 确定迁移数量并循环执行
         uint32_t num_to_migrate = MIN(source_count, target_count);
-        uint64_t total_latency = 0; // 累积总延迟
+        // uint64_t total_latency = 0; // 累积总延迟
         if (num_to_migrate > 0) {
             
             uint64_t current_sim_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
@@ -1390,7 +1390,7 @@ static void zns_check_and_balance_super_devices(FemuCtrl *n)
                      source_count, target_count);
         }
 
-/*         if (num_to_migrate > 0) {
+    /*         if (num_to_migrate > 0) {
             ftl_log("Balancing triggered: Moving %u zones from SD %d to SD %d.\n",
                     num_to_migrate, sd_above_thresh, sd_below_thresh);
             
@@ -1420,7 +1420,7 @@ static void zns_check_and_balance_super_devices(FemuCtrl *n)
              ftl_log("Balancing check: Found %u sources and %u targets. No migration possible.\n",
                      source_count, target_count);
         } */
-         
+
     }
 }
 
