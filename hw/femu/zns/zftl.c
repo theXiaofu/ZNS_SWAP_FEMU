@@ -21,6 +21,8 @@
 */
 #define ZONE_RESET_THRESHOLD 5
 #define CRITICAL_THRESHOLD_PERCENT 70
+#define MAX_LPNS_PER_ZONE 32768
+#define MAX_ZONES_TO_BALANCE_PER_CYCLE 256 // 新增：定义一次均衡操作中最多迁移的Zone数量
 /*
  * 新增：定义每个Zone可能包含的最大LPN数量。
  * 用于静态数组的大小定义。基于 128 MiB Zone / 4 KiB LPN 计算。
@@ -733,7 +735,7 @@ static const char* nvme_zone_state_str(NvmeZoneState state) {
  * 每个物理页写入操作的开始时间，取决于该物理页包含的LPN中，最晚完成读取的时间。
  * 使用静态数组存储读取时间。
  */
-static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_idx, uint32_t physical_dst_idx)
+static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_idx, uint32_t physical_dst_idx, uint64_t requested_start_time)
 {
     struct zns_ssd *zns = n->zns;
     NvmeNamespace *ns = n->namespaces;
@@ -800,7 +802,18 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
     }
     static uint64_t lpn_read_finish_times[MAX_LPNS_PER_ZONE]; // 静态数组
 
-    uint64_t start_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    /*
+     * 新增：根据 requested_start_time 确定实际的 start_time
+     * Added: Determine the actual start_time based on requested_start_time
+    */
+    uint64_t current_sim_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint64_t start_time;
+    if (requested_start_time == 0 || current_sim_time > requested_start_time) {
+        start_time = current_sim_time;
+    } else {
+        start_time = requested_start_time;
+    }
+    // uint64_t start_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     uint64_t max_overall_finish_time = start_time;
 
     ftl_log("Start pipelined v3 moving data for logical zone %u (phy %u [%s] -> %u [%s]), Check LPNs: %lu, Valid LPNs: %lu\n",
@@ -948,9 +961,19 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
     zns_assign_zone_state(ns, physical_src_zone, original_target_state); // Assign EMPTY state
     /* --- 元数据更新结束 --- */
     zns->active_zone = source_active_zone; // 恢复活动逻辑Zone索引
-    uint64_t total_latency = max_overall_finish_time > start_time ? max_overall_finish_time - start_time : 0;
-    ftl_log("Finished pipelined v3 moving data. Total estimated latency: %lu ns\n", total_latency);
-    return total_latency;
+
+    /*
+     * 修改：返回相对于 requested_start_time 的总延迟
+     * (max_overall_finish_time 是绝对完成时间)
+     * Modified: Return total latency relative to requested_start_time
+     * (max_overall_finish_time is the absolute finish time)
+    */
+    uint64_t return_latency = (max_overall_finish_time > requested_start_time) ? (max_overall_finish_time - requested_start_time) : 0;
+
+    ftl_log("Finished pipelined v3 moving data. (Req: %lu, Start: %lu, Finish: %lu) Total relative latency: %lu ns\n",
+            requested_start_time, start_time, max_overall_finish_time, return_latency);
+    
+    return return_latency;
 }
 
 
@@ -1018,11 +1041,21 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
     }
 
     uint64_t max_read_lat = 0, max_write_lat = 0;
-    uint64_t current_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    /*
+     * 新增：根据 requested_start_time 确定实际的 start_time
+     * Added: Determine the actual start_time based on requested_start_time
+    */
+    uint64_t current_sim_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint64_t start_time; // 替换原来的 'current_time'
+    if (requested_start_time == 0 || current_sim_time > requested_start_time) {
+        start_time = current_sim_time;
+    } else {
+        start_time = requested_start_time;
+    }
 
-    ftl_log("Start batched moving data for logical zone %u (phy %u [%s] -> %u [%s]), Valid LPNs: %lu\n",
-            logical_src_idx, physical_src_idx, nvme_zone_state_str(original_source_state),
-            physical_dst_idx, nvme_zone_state_str(original_target_state), num_valid_lpns);
+    ftl_log("Start batched moving data for logical zone %u (phy %u -> %u) at %lu ns\n",
+            logical_src_idx, physical_src_idx, physical_dst_idx, start_time);
+
 
     // 1. 读取阶段
     for (uint64_t i = 0; i < num_valid_lpns; i++) { // 只迭代有效 LPN 数量
@@ -1030,14 +1063,15 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
         if (lpn >= zns->l2p_sz) continue;
         struct ppa ppa = get_maptbl_ent(zns, lpn);
         if (mapped_ppa(&ppa) && ppa.g.blk == physical_src_idx) {
-            struct nand_cmd srd = { .cmd = NAND_READ, .type = GC_IO, .stime = current_time };
+            /* 修改：使用新的 'start_time' */
+            struct nand_cmd srd = { .cmd = NAND_READ, .type = GC_IO, .stime = start_time };
             uint64_t sublat = zns_advance_status(zns, &ppa, &srd);
             max_read_lat = (sublat > max_read_lat) ? sublat : max_read_lat;
         }
     }
 
     // 2. 写入阶段
-    uint64_t write_start_time = current_time + max_read_lat;
+    uint64_t write_start_time = start_time + max_read_lat;
     uint32_t source_active_zone = zns->active_zone; // 保存当前活动逻辑Zone索引
     zns->active_zone = logical_src_idx;
     zns->logical_to_physical_zone_map[logical_src_idx] = physical_dst_idx;
@@ -1113,9 +1147,21 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
     /* --- 元数据更新结束 --- */
     zns->active_zone = source_active_zone; // 恢复活动逻辑Zone索引
 
-    ftl_log("Finished batched moving data. Total latency estimate: %lu ns (max_read %lu + max_write %lu)\n",
-            max_read_lat + max_write_lat, max_read_lat, max_write_lat);
-    return max_read_lat + max_write_lat;
+    /*
+     * 修改：返回相对于 requested_start_time 的总延迟
+     * (绝对完成时间 = start_time + max_read_lat + max_write_lat)
+     * Modified: Return total latency relative to requested_start_time
+     * (Absolute finish time = start_time + max_read_lat + max_write_lat)
+     */
+    uint64_t op_duration = max_read_lat + max_write_lat;
+    uint64_t absolute_finish_time = start_time + op_duration;
+
+    uint64_t return_latency = (absolute_finish_time > requested_start_time) ? (absolute_finish_time - requested_start_time) : 0;
+
+    ftl_log("Finished batched moving data. (Req: %lu, Start: %lu, Finish: %lu) Total relative latency: %lu ns (R: %lu + W: %lu)\n",
+            requested_start_time, start_time, absolute_finish_time, return_latency, max_read_lat, max_write_lat);
+            
+    return return_latency;
 }
 
 
@@ -1125,6 +1171,7 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
  * 最终版：zns_check_and_balance_super_devices 函数。
  * 查找超载SD上的逻辑冷Zone和轻载SD上的物理空Zone，调用批处理模式进行迁移。
  */
+/*
 static void zns_check_and_balance_super_devices(FemuCtrl *n)
 {
     struct zns_ssd *zns = n->zns;
@@ -1190,13 +1237,13 @@ static void zns_check_and_balance_super_devices(FemuCtrl *n)
              ftl_log("Balancing triggered: Moving logical zone %u (from physical SD %d, phy_zone %u) to physical zone %u (on SD %d).\n",
                     logical_src_idx, sd_above_thresh, zns->logical_to_physical_zone_map[logical_src_idx],
                     physical_dst_idx, sd_below_thresh);
-            /* 调用批处理模式进行迁移 */
+            // 调用批处理模式进行迁移 
             
             uint64_t latency; 
             if(use_batch){
             latency = zns_move_zone_data_batched(n, logical_src_idx, physical_dst_idx);
             }else{
-            /* 调用流水线模式进行迁移 */
+            // 调用流水线模式进行迁移 
             zns_move_zone_data_pipelined(n, logical_src_idx, physical_dst_idx);
             }
             printf("Balancing completed with estimated latency: %lu ns\n", latency);
@@ -1206,7 +1253,176 @@ static void zns_check_and_balance_super_devices(FemuCtrl *n)
         }
     }
 }
+*/
 
+/*
+ * 最终版 (修改后)：zns_check_and_balance_super_devices 函数。
+ * 查找超载SD上的 *所有* 逻辑冷Zone和轻载SD上的 *所有* 物理空Zone，
+ * 然后批量调用迁移函数，最多迁移 MAX_ZONES_TO_BALANCE_PER_CYCLE 个 Zone。
+ */
+static void zns_check_and_balance_super_devices(FemuCtrl *n)
+{
+    struct zns_ssd *zns = n->zns;
+    bool use_batch = true; // 您仍然可以在这里切换批处理/流水线模式
+    
+    // 健壮性检查 (同前)
+    if (!zns || n->num_zones == 0 || zns->num_sd == 0) return;
+    uint32_t zones_per_sd = n->num_zones / zns->num_sd;
+    if (zones_per_sd == 0) return;
+
+    // zns->num_sd 固定为 2
+    uint32_t cold_zone_counts[2];
+    int sd_above_thresh = -1, sd_below_thresh = -1;
+
+    memset(cold_zone_counts, 0, sizeof(cold_zone_counts));
+
+    // 1. 统计每个物理SD上的冷Zone数量 (同前)
+    for (uint32_t i = 0; i < n->num_zones; i++) {
+        NvmeZone *p_zone = &n->zone_array[i];
+        int sd_idx = i % zns->num_sd;
+        // 判定为冷Zone：reset_count 低于阈值且 Zone 非空
+        if (p_zone->reset_count < ZONE_RESET_THRESHOLD && zns_get_zone_state(p_zone) != NVME_ZONE_STATE_EMPTY) {
+            cold_zone_counts[sd_idx]++;
+        }
+    }
+
+    // 2. 寻找超载和轻载的SD (同前)
+    for (int i = 0; i < zns->num_sd; i++) {
+        uint32_t threshold = (zones_per_sd * CRITICAL_THRESHOLD_PERCENT) / 100;
+        threshold = MAX(threshold, 1);
+        if (cold_zone_counts[i] > threshold) sd_above_thresh = i;
+        else if (sd_below_thresh == -1 || cold_zone_counts[i] < cold_zone_counts[sd_below_thresh]) sd_below_thresh = i;
+    }
+
+    // 3. (***修改***) 寻找 *所有* 可迁移的Zone并批量执行
+    if (sd_above_thresh != -1 && sd_below_thresh != -1 && sd_above_thresh != sd_below_thresh) {
+        
+        // 使用静态数组存储待迁移的Zone列表
+        uint32_t source_zones[MAX_ZONES_TO_BALANCE_PER_CYCLE];
+        uint32_t target_zones[MAX_ZONES_TO_BALANCE_PER_CYCLE];
+        uint32_t source_count = 0;
+        uint32_t target_count = 0;
+
+        // 3a. 寻找 *所有* 源 (逻辑冷Zone)
+        for (uint32_t i = 0; i < n->num_zones; i++) {
+            if (source_count >= MAX_ZONES_TO_BALANCE_PER_CYCLE) break; // 防止数组溢出
+
+            uint32_t p_idx = zns->logical_to_physical_zone_map[i];
+            if ((p_idx % zns->num_sd) == sd_above_thresh) {
+                 NvmeZone *p_zone = &n->zone_array[p_idx];
+                 // 必须是冷Zone且非空
+                if (p_zone->reset_count < ZONE_RESET_THRESHOLD && zns_get_zone_state(p_zone) != NVME_ZONE_STATE_EMPTY) {
+                    source_zones[source_count++] = i;
+                }
+            }
+        }
+
+        // 3b. 寻找 *所有* 目标 (物理空Zone)
+        for (uint32_t i = 0; i < n->num_zones; i++) {
+            if (target_count >= MAX_ZONES_TO_BALANCE_PER_CYCLE) break; // 防止数组溢出
+
+            if ((i % zns->num_sd) == sd_below_thresh) {
+                 if (zns_get_zone_state(&n->zone_array[i]) == NVME_ZONE_STATE_EMPTY) {
+                    target_zones[target_count++] = i;
+                }
+            }
+        }
+
+        // 3c. 确定迁移数量并循环执行
+        uint32_t num_to_migrate = MIN(source_count, target_count);
+        uint64_t total_latency = 0; // 累积总延迟
+        if (num_to_migrate > 0) {
+            
+            uint64_t current_sim_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            uint64_t start_time_for_next_op; // 用于批处理模式
+            uint64_t start_time_for_all_ops; // 用于流水线模式
+            uint64_t total_accumulated_latency = 0; // 批处理模式：延迟总和
+            uint64_t max_parallel_latency = 0;      // 流水线模式：最大延迟
+            
+            if (use_batch) {
+                // 批处理模式：串行执行。下一个操作的开始时间是当前时间。
+                start_time_for_next_op = current_sim_time;
+                ftl_log("Balancing triggered (Batch Mode): Moving %u zones serially from SD %d to SD %d. Start time: %lu ns\n",
+                        num_to_migrate, sd_above_thresh, sd_below_thresh, start_time_for_next_op);
+            } else {
+                // 流水线模式：并行执行。所有操作都在同一时间开始。
+                start_time_for_all_ops = current_sim_time;
+                ftl_log("Balancing triggered (Pipeline Mode): Moving %u zones in parallel from SD %d to SD %d. Start time: %lu ns\n",
+                        num_to_migrate, sd_above_thresh, sd_below_thresh, start_time_for_all_ops);
+            }
+
+            for (uint32_t i = 0; i < num_to_migrate; i++) {
+                uint32_t logical_src_idx = source_zones[i];
+                uint32_t physical_dst_idx = target_zones[i];
+
+                ftl_log("  -> Migrating logical %u (phy %u) to phy %u\n",
+                        logical_src_idx, zns->logical_to_physical_zone_map[logical_src_idx], physical_dst_idx);
+
+                uint64_t duration; // 存储单次迁移的 *持续时间*
+                
+                if(use_batch){
+                    // 1. 调用批处理，传入 *下一个* 可用时间
+                    duration = zns_move_zone_data_batched(n, logical_src_idx, physical_dst_idx, start_time_for_next_op);
+                    // 2. 累加总延迟 (串行)
+                    total_accumulated_latency += duration;
+                    // 3. 更新下一个操作的开始时间
+                    start_time_for_next_op += duration; 
+                }else{
+                    // 1. 调用流水线，传入 *同一个* 开始时间
+                    duration = zns_move_zone_data_pipelined(n, logical_src_idx, physical_dst_idx, start_time_for_all_ops);
+                    // 2. 记录最大延迟 (并行)
+                    max_parallel_latency = MAX(max_parallel_latency, duration);
+                }
+            }
+
+            // 循环外，根据模式打印总报告
+            if (use_batch) {
+                 printf("Balancing completed %u migrations (Batch Mode). Total accumulated (serial) latency: %lu ns\n",
+                       num_to_migrate, total_accumulated_latency);
+            } else {
+                 // 流水线模式下，总延迟等于所有并行操作中，耗时最长的那个操作的延迟
+                 printf("Balancing completed %u migrations (Pipeline Mode). Total operation (parallel) latency: %lu ns\n",
+                       num_to_migrate, max_parallel_latency);
+            }
+
+        } else {
+             ftl_log("Balancing check: Found %u sources and %u targets. No migration possible.\n",
+                     source_count, target_count);
+        }
+
+/*         if (num_to_migrate > 0) {
+            ftl_log("Balancing triggered: Moving %u zones from SD %d to SD %d.\n",
+                    num_to_migrate, sd_above_thresh, sd_below_thresh);
+            
+            for (uint32_t i = 0; i < num_to_migrate; i++) {
+                uint32_t logical_src_idx = source_zones[i];
+                uint32_t physical_dst_idx = target_zones[i];
+
+                ftl_log("  -> Migrating logical %u (phy %u) to phy %u\n",
+                        logical_src_idx, zns->logical_to_physical_zone_map[logical_src_idx], physical_dst_idx);
+
+                uint64_t latency; 
+                if(use_batch){
+                    // 调用批处理模式
+                    latency = zns_move_zone_data_batched(n, logical_src_idx, physical_dst_idx);
+                }else{
+                    // 调用流水线模式
+                    latency = zns_move_zone_data_pipelined(n, logical_src_idx, physical_dst_idx);
+                }
+                // 假设迁移是串行执行的，累加总延迟
+                total_latency += latency;
+            }
+
+            // 在FEMU控制台打印总报告
+            printf("Balancing completed %u migrations. Total accumulated latency: %lu ns\n",
+                   num_to_migrate, total_latency);
+        } else {
+             ftl_log("Balancing check: Found %u sources and %u targets. No migration possible.\n",
+                     source_count, target_count);
+        } */
+         
+    }
+}
 
 // FTL 主线程
 static void *ftl_thread(void *arg)
