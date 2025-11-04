@@ -403,7 +403,26 @@ static uint16_t zns_check_zone_write(FemuCtrl *n, NvmeNamespace *ns,
                                      NvmeZone *zone, uint64_t slba,
                                      uint32_t nlb, bool append)
 {
+    /*
+     * 新增：修复L2P映射导致的竞态条件
+     * -----------------------------------------------------------------
+     * 传入的 'slba' 是 逻辑SLBA，而 'zone' 是 物理Zone。
+     * 我们必须在所有检查之前，将 逻辑SLBA 转换为 期望的物理SLBA。
+     */
+    
+    // 1. 根据 逻辑SLBA 计算出它所属的 逻辑Zone 索引
+    uint32_t logical_zone_idx = zns_zone_idx(ns, slba);
+    // 2. 计算 逻辑Zone 的起始地址
+    uint64_t logical_zslba = (uint64_t)logical_zone_idx * n->zone_size;
+    // 3. 计算 逻辑SLBA 在 逻辑Zone 内的偏移量
+    uint64_t offset_in_zone = slba - logical_zslba;
+    
+    // 4. 将 逻辑偏移量 应用到 物理Zone 的起始地址上，得到 期望的物理SLBA
+    //    并用这个 期望的物理SLBA 覆盖掉旧的 逻辑SLBA
+    slba = zone->d.zslba + offset_in_zone;
+
     uint16_t status;
+
 
     if (unlikely((slba + nlb) > zns_zone_wr_boundary(zone))) {
         status = NVME_ZONE_BOUNDARY_ERROR;
@@ -421,9 +440,11 @@ static uint16_t zns_check_zone_write(FemuCtrl *n, NvmeNamespace *ns,
             if (zns_l2b(ns, nlb) > (n->page_size << n->zasl)) {
                 status = NVME_INVALID_FIELD;
             }
+
         } else if (unlikely(slba != zone->w_ptr)) {
             status = NVME_ZONE_INVALID_WRITE;
         }
+
     }
 
     return status;
@@ -457,7 +478,67 @@ static uint16_t zns_check_zone_state_for_read(NvmeZone *zone)
 
     return status;
 }
+static uint16_t zns_check_zone_read(NvmeNamespace *ns, uint64_t slba, uint32_t nlb)
+{
+    FemuCtrl *n = ns->ctrl;
+    // 'slba' 是 逻辑SLBA，我们保留它的原始值
+    uint64_t logical_slba = slba; 
+    
+    // 1. 获取第一个LBA对应的 物理Zone
+    NvmeZone *zone = zns_get_zone_by_slba(ns, logical_slba);
+    
+    // 2. 计算 逻辑结束地址
+    uint64_t logical_end = logical_slba + nlb;
+    
+    // 3. 计算第一个 逻辑Zone 的索引和边界
+    uint32_t logical_zone_idx = zns_zone_idx(ns, logical_slba);
+    uint64_t logical_bndry = (uint64_t)(logical_zone_idx + 1) * n->zone_size;
 
+    uint16_t status;
+
+    // 4. 检查第一个 物理Zone 的状态
+    status = zns_check_zone_state_for_read(zone);
+    
+    if (status != NVME_SUCCESS) {
+        ;
+    } else if (unlikely(logical_end > logical_bndry)) { 
+        // 5. 修复：检查 逻辑结束地址 是否超过了 逻辑边界
+        
+        if (!n->cross_zone_read) {
+            status = NVME_ZONE_BOUNDARY_ERROR;
+        } else {
+            /*
+             * 修复：在 逻辑空间 中迭代，查找每个 逻辑Zone 对应的 物理Zone
+             */
+            do {
+                // a. 移动到下一个 逻辑Zone 索引
+                logical_zone_idx++;
+                if (logical_zone_idx >= n->num_zones) {
+                    // 防止越界（虽然不太可能，因为有 nsze 检查）
+                    break; 
+                }
+
+                // b. 查找这个 逻辑Zone 对应的 物理Zone
+                uint32_t physical_zone_idx = n->zns->logical_to_physical_zone_map[logical_zone_idx];
+                assert(physical_zone_idx < n->num_zones);
+                zone = &n->zone_array[physical_zone_idx];
+
+                // c. 检查这个 物理Zone 的状态
+                status = zns_check_zone_state_for_read(zone);
+                if (status != NVME_SUCCESS) {
+                    break;
+                }
+                
+                // d. 更新 逻辑边界 (用于下一次 do-while 循环检查)
+                logical_bndry = (uint64_t)(logical_zone_idx + 1) * n->zone_size;
+
+            } while (logical_end > logical_bndry); // 循环直到 逻辑结束地址 不再跨越 逻辑边界
+        }
+    }
+
+    return status;
+}
+/* 
 static uint16_t zns_check_zone_read(NvmeNamespace *ns, uint64_t slba, uint32_t nlb)
 {
     FemuCtrl *n = ns->ctrl;
@@ -473,10 +554,10 @@ static uint16_t zns_check_zone_read(NvmeNamespace *ns, uint64_t slba, uint32_t n
         if (!n->cross_zone_read) {
             status = NVME_ZONE_BOUNDARY_ERROR;
         } else {
-            /*
-             * Read across zone boundary - check that all subsequent
-             * zones that are being read have an appropriate state.
-             */
+            
+            //  Read across zone boundary - check that all subsequent
+            //  zones that are being read have an appropriate state.
+             
             do {
                 zone++;
                 status = zns_check_zone_state_for_read(zone);
@@ -488,7 +569,8 @@ static uint16_t zns_check_zone_read(NvmeNamespace *ns, uint64_t slba, uint32_t n
     }
 
     return status;
-}
+} 
+*/
 
 /*
  * zns_check_zone_read

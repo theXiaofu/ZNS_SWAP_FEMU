@@ -748,6 +748,30 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
     uint32_t original_source_reset_count = physical_src_zone->reset_count;
     uint32_t original_target_reset_count = physical_dst_zone->reset_count; // Should be low/0 as target is EMPTY
 
+    // 新增：查找当前映射到 目标物理Zone 的 逻辑Zone ("受害者")
+    // Added: Find the logical zone ("victim") currently mapped to the target physical zone
+    uint32_t logical_dst_idx = -1;
+    for (uint32_t i = 0; i < n->num_zones; i++) {
+        if (zns->logical_to_physical_zone_map[i] == physical_dst_idx) {
+            logical_dst_idx = i;
+            break;
+        }
+    }
+
+    // 健壮性检查
+    if (logical_dst_idx == -1) {
+        ftl_err("Move Error: No logical zone maps to target physical zone %u!\n", physical_dst_idx);
+        printf("Move Error: No logical zone maps to target physical zone %u!\n", physical_dst_idx);
+        return 0; // 失败
+    }
+
+    // 检查是否在尝试将一个Zone移动到自己（逻辑上）
+    if (logical_dst_idx == logical_src_idx) {
+         ftl_err("Move Error: Source and victim logical zones are the same (%u)!\n", logical_src_idx);
+         printf("Move Error: Source and victim logical zones are the same (%u)!\n", logical_src_idx);
+        return 0; // 失败
+    }
+
     if (original_target_state != NVME_ZONE_STATE_EMPTY) {
         ftl_err("Pipelined Move: Target physical zone %u is not empty!\n", physical_dst_idx);
         printf("Pipelined Move: Target physical zone %u is not empty!\n", physical_dst_idx);
@@ -839,6 +863,7 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
 
     // 临时更新映射
     zns->logical_to_physical_zone_map[logical_src_idx] = physical_dst_idx;
+    zns->logical_to_physical_zone_map[logical_dst_idx] = physical_src_idx;
 
     uint32_t source_active_zone = zns->active_zone; // 保存当前活动逻辑Zone索引
     zns->active_zone = logical_src_idx; // 我仅仅是更新映射，感觉不需要更新active_zone
@@ -855,6 +880,7 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
             if (ppa.ppa == UNMAPPED_PPA) {
                  ftl_err("Pipelined Move: Failed to get new page in write phase.\n");
                  zns->logical_to_physical_zone_map[logical_src_idx] = physical_src_idx; // 恢复映射
+                 zns->logical_to_physical_zone_map[logical_dst_idx] = physical_dst_idx; // 恢复映射
                  zns->active_zone = source_active_zone; // 恢复活动逻辑Zone索引
                  return 0; // 失败
             }
@@ -999,6 +1025,30 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
     uint32_t original_source_reset_count = physical_src_zone->reset_count;
     uint32_t original_target_reset_count = physical_dst_zone->reset_count;
 
+    // 新增：查找当前映射到 目标物理Zone 的 逻辑Zone ("受害者")
+    // Added: Find the logical zone ("victim") currently mapped to the target physical zone
+    uint32_t logical_dst_idx = -1;
+    for (uint32_t i = 0; i < n->num_zones; i++) {
+        if (zns->logical_to_physical_zone_map[i] == physical_dst_idx) {
+            logical_dst_idx = i;
+            break;
+        }
+    }
+
+    // 健壮性检查
+    if (logical_dst_idx == -1) {
+        ftl_err("Move Error: No logical zone maps to target physical zone %u!\n", physical_dst_idx);
+        printf("Move Error: No logical zone maps to target physical zone %u!\n", physical_dst_idx);
+        return 0; // 失败
+    }
+
+    // 检查是否在尝试将一个Zone移动到自己（逻辑上）
+    if (logical_dst_idx == logical_src_idx) {
+         ftl_err("Move Error: Source and victim logical zones are the same (%u)!\n", logical_src_idx);
+         printf("Move Error: Source and victim logical zones are the same (%u)!\n", logical_src_idx);
+        return 0; // 失败
+    }
+
     if (original_target_state != NVME_ZONE_STATE_EMPTY) {
         printf("Batched Move: Target physical zone %u is not empty!\n", physical_dst_idx);
         return 0; // 失败
@@ -1013,6 +1063,7 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
     if (num_valid_lpns == 0) {
         ftl_log("Batched Move: No valid data to move for logical zone %u.\n", logical_src_idx);
         zns->logical_to_physical_zone_map[logical_src_idx] = physical_dst_idx;
+        zns->logical_to_physical_zone_map[logical_dst_idx] = physical_src_idx;
         physical_dst_zone->w_ptr = physical_dst_zone->d.zslba;
         physical_dst_zone->d.wp = physical_dst_zone->w_ptr;
         // 目标继承源 reset_count
@@ -1075,6 +1126,7 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
     uint32_t source_active_zone = zns->active_zone; // 保存当前活动逻辑Zone索引
     zns->active_zone = logical_src_idx;
     zns->logical_to_physical_zone_map[logical_src_idx] = physical_dst_idx;
+    zns->logical_to_physical_zone_map[logical_dst_idx] = physical_src_idx;
 
     uint64_t lpn_offset = 0; // 跟踪实际写入的有效 LPN 数量
     while (lpn_offset < num_valid_lpns) {
@@ -1083,6 +1135,7 @@ static uint64_t zns_move_zone_data_batched(FemuCtrl *n, uint32_t logical_src_idx
             if (ppa.ppa == UNMAPPED_PPA) {
                  ftl_err("Batched Move: Failed to get new page in write phase.\n");
                  zns->logical_to_physical_zone_map[logical_src_idx] = physical_src_idx; // 恢复映射
+                 zns->logical_to_physical_zone_map[logical_dst_idx] = physical_dst_idx; // 恢复映射
                  zns->active_zone = source_active_zone; // 恢复活动逻辑Zone索引
                  return 0; // 失败
             }
@@ -1424,6 +1477,189 @@ static void zns_check_and_balance_super_devices(FemuCtrl *n)
     }
 }
 
+/*
+ * (最终版 - 混合策略)：zns_check_and_balance_super_devices 函数。
+ * * 实现了基于“阈值触发” + “均值目标” + “最小迁移量”的均衡策略：
+ * 1. 统计两个SD上的冷Zone数量 (cold_zone_counts[0] 和 cold_zone_counts[1])。
+ * 2. 检查是否有SD的冷Zone比例超过 CRITICAL_THRESHOLD_PERCENT (sd_above_thresh)。
+ * 3. [触发条件1]：如果没有任何SD超过阈值，则不均衡。
+ * 4. 如果触发，计算总冷Zone数 (total_cold_zones) 和 平均冷Zone数 (average_cold_zones)。
+ * 5. 找出源SD (sd_source = sd_above_thresh) 和目标SD (sd_target = sd_below_thresh)。
+ * 6. 计算需要迁移的数量 (num_to_migrate_needed) = 源SD冷Zone数 - 平均冷Zone数。
+ * 7. [触发条件2]：如果 num_to_migrate_needed <= 1，则不均衡。
+ * 8. 如果两个条件都满足，则查找所有可用的源Zone和目标Zone。
+ * 9. 确定最终迁移量 (num_to_migrate)，取以下三者的最小值：
+ * (num_to_migrate_needed, 可用的源Zone数, 可用的目标Zone数)
+ * 10. 批量执行迁移。
+ */
+static void zns_check_and_balance_super_devices(FemuCtrl *n)
+{
+    struct zns_ssd *zns = n->zns;
+    bool use_batch = true; // 仍然可以在这里切换批处理/流水线模式
+    
+    // 健壮性检查
+    if (!zns || n->num_zones == 0 || zns->num_sd == 0) return;
+    uint32_t zones_per_sd = n->num_zones / zns->num_sd;
+    if (zones_per_sd == 0) return;
+    
+    // 该策略目前仅支持2个SD
+    if (zns->num_sd != 2) {
+        ftl_err("Balancing Error: Strategy requires exactly 2 Super Devices (num_sd = %u)\n", zns->num_sd);
+        return;
+    }
+
+    uint32_t cold_zone_counts[2];
+    int sd_above_thresh = -1, sd_below_thresh = -1;
+    uint32_t total_cold_zones = 0;
+    uint32_t average_cold_zones = 0;
+    uint32_t num_to_migrate_needed = 0;
+
+    memset(cold_zone_counts, 0, sizeof(cold_zone_counts));
+
+    // 1. 统计每个物理SD上的冷Zone数量
+    for (uint32_t i = 0; i < n->num_zones; i++) {
+        NvmeZone *p_zone = &n->zone_array[i];
+        int sd_idx = i % zns->num_sd;
+        // 判定为冷Zone：reset_count 低于阈值且 Zone 非空
+        if (p_zone->reset_count < ZONE_RESET_THRESHOLD && zns_get_zone_state(p_zone) != NVME_ZONE_STATE_EMPTY) {
+            cold_zone_counts[sd_idx]++;
+        }
+    }
+
+    // 2. 寻找超载 (sd_above_thresh) 和轻载 (sd_below_thresh) 的SD
+    for (int i = 0; i < zns->num_sd; i++) {
+        uint32_t threshold = (zones_per_sd * CRITICAL_THRESHOLD_PERCENT) / 100;
+        threshold = MAX(threshold, 1);
+        
+        if (cold_zone_counts[i] > threshold) sd_above_thresh = i;
+        else if (sd_below_thresh == -1 || cold_zone_counts[i] < cold_zone_counts[sd_below_thresh]) sd_below_thresh = i;
+    }
+
+    // 3. [触发条件1] 检查：是否触发了阈值？
+    if (sd_above_thresh != -1 && sd_below_thresh != -1 && sd_above_thresh != sd_below_thresh) {
+        
+        int sd_source = sd_above_thresh; // 源SD是超过阈值的那个
+        int sd_target = sd_below_thresh; // 目标SD是冷Zone最少的那个
+        
+        // 4. 计算均值
+        total_cold_zones = cold_zone_counts[0] + cold_zone_counts[1];
+        average_cold_zones = total_cold_zones / 2; // (zns->num_sd == 2)
+        
+        // 5. 计算需要迁移多少个Zone才能达到平均值
+        if (cold_zone_counts[sd_source] > average_cold_zones) {
+            num_to_migrate_needed = cold_zone_counts[sd_source] - average_cold_zones;
+        } else {
+            num_to_migrate_needed = 0;
+        }
+
+        // 6. [触发条件2] 检查：需要迁移的Zone数是否大于1？
+        if (num_to_migrate_needed > 1) {
+            
+            // 7. 寻找所有可迁移的Zone
+            // 使用静态数组存储待迁移的Zone列表
+            uint32_t source_zones[MAX_ZONES_TO_BALANCE_PER_CYCLE];
+            uint32_t target_zones[MAX_ZONES_TO_BALANCE_PER_CYCLE];
+            uint32_t source_count = 0;
+            uint32_t target_count = 0;
+
+            // 7a. 寻找源 (来自 sd_source 的逻辑冷Zone)
+            for (uint32_t i = 0; i < n->num_zones; i++) {
+                if (source_count >= MAX_ZONES_TO_BALANCE_PER_CYCLE) break; // 防止数组溢出
+
+                uint32_t p_idx = zns->logical_to_physical_zone_map[i];
+                if ((p_idx % zns->num_sd) == sd_source) {
+                     NvmeZone *p_zone = &n->zone_array[p_idx];
+                     // 必须是冷Zone且非空
+                    if (p_zone->reset_count < ZONE_RESET_THRESHOLD && zns_get_zone_state(p_zone) != NVME_ZONE_STATE_EMPTY) {
+                        source_zones[source_count++] = i;
+                    }
+                }
+            }
+
+            // 7b. 寻找目标 (来自 sd_target 的物理空Zone)
+            for (uint32_t i = 0; i < n->num_zones; i++) {
+                if (target_count >= MAX_ZONES_TO_BALANCE_PER_CYCLE) break; // 防止数组溢出
+
+                if ((i % zns->num_sd) == sd_target) {
+                     if (zns_get_zone_state(&n->zone_array[i]) == NVME_ZONE_STATE_EMPTY) {
+                        target_zones[target_count++] = i;
+                    }
+                }
+            }
+
+            // 8. 确定最终迁移数量
+            uint32_t num_to_migrate = MIN(num_to_migrate_needed, source_count);
+            num_to_migrate = MIN(num_to_migrate, target_count);
+
+            // 9. 批量执行迁移
+            if (num_to_migrate > 0) {
+                
+                uint64_t current_sim_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                uint64_t start_time_for_next_op; // 用于批处理模式
+                uint64_t start_time_for_all_ops; // 用于流水线模式
+                uint64_t total_accumulated_latency = 0; // 批处理模式：延迟总和
+                uint64_t max_parallel_latency = 0;      // 流水线模式：最大延迟
+                
+                if (use_batch) {
+                    start_time_for_next_op = current_sim_time;
+                    ftl_log("Balancing triggered (Batch Mode, Threshold+Avg): Need %u, Migrating %u zones serially from SD %d (has %u) to SD %d (has %u). Start: %lu ns\n",
+                            num_to_migrate_needed, num_to_migrate, sd_source, cold_zone_counts[sd_source], sd_target, cold_zone_counts[sd_target], start_time_for_next_op);
+                } else {
+                    start_time_for_all_ops = current_sim_time;
+                    ftl_log("Balancing triggered (Pipeline Mode, Threshold+Avg): Need %u, Migrating %u zones in parallel from SD %d (has %u) to SD %d (has %u). Start: %lu ns\n",
+                            num_to_migrate_needed, num_to_migrate, sd_source, cold_zone_counts[sd_source], sd_target, cold_zone_counts[sd_target], start_time_for_all_ops);
+                }
+
+                for (uint32_t i = 0; i < num_to_migrate; i++) {
+                    uint32_t logical_src_idx = source_zones[i];
+                    uint32_t physical_dst_idx = target_zones[i];
+
+                    ftl_log("  -> Migrating logical %u (phy %u) to phy %u\n",
+                            logical_src_idx, zns->logical_to_physical_zone_map[logical_src_idx], physical_dst_idx);
+
+                    uint64_t duration; // 存储单次迁移的 *持续时间*
+                    
+                    if(use_batch){
+                        // 1. 调用批处理，传入 *下一个* 可用时间
+                        duration = zns_move_zone_data_batched(n, logical_src_idx, physical_dst_idx, start_time_for_next_op);
+                        // 2. 累加总延迟 (串行)
+                        total_accumulated_latency += duration;
+                        // 3. 更新下一个操作的开始时间
+                        start_time_for_next_op += duration;
+                    }else{
+                        // 1. 调用流水线，传入 *同一个* 开始时间
+                        duration = zns_move_zone_data_pipelined(n, logical_src_idx, physical_dst_idx, start_time_for_all_ops);
+                        // 2. 记录最大延迟 (并行)
+                        max_parallel_latency = MAX(max_parallel_latency, duration);
+                    }
+                }
+
+                // 循环外，根据模式打印总报告
+                if (use_batch) {
+                     printf("Balancing completed %u migrations (Batch Mode). Total accumulated (serial) latency: %lu ns\n",
+                           num_to_migrate, total_accumulated_latency);
+                } else {
+                     // 流水线模式下，总延迟等于所有并行操作中，耗时最长的那个操作的延迟
+                     printf("Balancing completed %u migrations (Pipeline Mode). Total operation (parallel) latency: %lu ns\n",
+                           num_to_migrate, max_parallel_latency);
+                }
+
+            } else {
+                 ftl_log("Balancing check (Threshold+Avg): Need %u. Found %u sources and %u targets. No migration possible.\n",
+                         num_to_migrate_needed, source_count, target_count);
+            }
+        } else {
+            // [触发条件2] 未满足
+            ftl_log("Balancing check (Threshold+Avg): Triggered (SD%d > %d%%), but migration need (%u) is not > 1. No balancing required.\n",
+                    sd_source, CRITICAL_THRESHOLD_PERCENT, num_to_migrate_needed);
+        }
+    } else {
+        // [触发条件1] 未满足
+        // (可选日志)
+        // ftl_log("Balancing check (Threshold+Avg): System is below critical threshold (SD0: %u, SD1: %u cold zones). No balancing required.\n",
+        //         cold_zone_counts[0], cold_zone_counts[1]);
+    }
+}
 // FTL 主线程
 static void *ftl_thread(void *arg)
 {
