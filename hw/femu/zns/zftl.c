@@ -1313,6 +1313,8 @@ static void zns_check_and_balance_super_devices(FemuCtrl *n)
  * 查找超载SD上的 *所有* 逻辑冷Zone和轻载SD上的 *所有* 物理空Zone，
  * 然后批量调用迁移函数，最多迁移 MAX_ZONES_TO_BALANCE_PER_CYCLE 个 Zone。
  */
+
+/*
 static void zns_check_and_balance_super_devices(FemuCtrl *n)
 {
     struct zns_ssd *zns = n->zns;
@@ -1443,39 +1445,10 @@ static void zns_check_and_balance_super_devices(FemuCtrl *n)
                      source_count, target_count);
         }
 
-    /*         if (num_to_migrate > 0) {
-            ftl_log("Balancing triggered: Moving %u zones from SD %d to SD %d.\n",
-                    num_to_migrate, sd_above_thresh, sd_below_thresh);
-            
-            for (uint32_t i = 0; i < num_to_migrate; i++) {
-                uint32_t logical_src_idx = source_zones[i];
-                uint32_t physical_dst_idx = target_zones[i];
-
-                ftl_log("  -> Migrating logical %u (phy %u) to phy %u\n",
-                        logical_src_idx, zns->logical_to_physical_zone_map[logical_src_idx], physical_dst_idx);
-
-                uint64_t latency; 
-                if(use_batch){
-                    // 调用批处理模式
-                    latency = zns_move_zone_data_batched(n, logical_src_idx, physical_dst_idx);
-                }else{
-                    // 调用流水线模式
-                    latency = zns_move_zone_data_pipelined(n, logical_src_idx, physical_dst_idx);
-                }
-                // 假设迁移是串行执行的，累加总延迟
-                total_latency += latency;
-            }
-
-            // 在FEMU控制台打印总报告
-            printf("Balancing completed %u migrations. Total accumulated latency: %lu ns\n",
-                   num_to_migrate, total_latency);
-        } else {
-             ftl_log("Balancing check: Found %u sources and %u targets. No migration possible.\n",
-                     source_count, target_count);
-        } */
 
     }
 }
+*/
 
 /*
  * (最终版 - 混合策略)：zns_check_and_balance_super_devices 函数。
