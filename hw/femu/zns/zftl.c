@@ -1675,7 +1675,7 @@ static void zns_check_and_balance_super_devices(FemuCtrl *n)
 static void zns_check_and_balance_super_devices(FemuCtrl *n)
 {
     struct zns_ssd *zns = n->zns;
-    bool use_batch = true; // 仍然可以在这里切换批处理/流水线模式
+    bool use_batch = false; // 仍然可以在这里切换批处理/流水线模式
     
     // 健壮性检查
     if (!zns || n->num_zones == 0 || zns->num_sd == 0) return;
