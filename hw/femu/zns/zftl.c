@@ -1072,6 +1072,9 @@ static uint64_t zns_move_zone_data_pipelined(FemuCtrl *n, uint32_t logical_src_i
         * (max_erase_finish_time is the absolute finish time including erase)
     */
     uint64_t return_latency1 = (max_erase_finish_time > requested_start_time) ? (max_erase_finish_time - requested_start_time) : 0;
+    // 日志输出擦除延迟和写延迟
+    ftl_log("Pipelined Move: Completed moving data for logical zone %u. Write finish time: %lu ns, Erase finish time: %lu ns, Total latency returned: %lu ns (write), %lu ns (erase)\n",
+            logical_src_idx, max_overall_finish_time, max_erase_finish_time, return_latency, return_latency1);
     return_latency = MAX(return_latency, return_latency1);
 
 
@@ -1776,7 +1779,7 @@ static void zns_check_and_balance_super_devices(FemuCtrl *n)
                 
                 uint64_t current_sim_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
                 uint64_t start_time_for_next_op; // 用于批处理模式
-                uint64_t start_time_for_all_ops; // 用于流水线模式
+                // uint64_t start_time_for_all_ops; // 用于流水线模式
                 uint64_t total_accumulated_latency = 0; // 批处理模式：延迟总和
                 // uint64_t max_parallel_latency = 0;      // 流水线模式：最大延迟
                 
@@ -1785,9 +1788,9 @@ static void zns_check_and_balance_super_devices(FemuCtrl *n)
                     ftl_log("Balancing triggered (Batch Mode, Threshold+Avg): Need %u, Migrating %u zones serially from SD %d (has %u) to SD %d (has %u). Start: %lu ns\n",
                             num_to_migrate_needed, num_to_migrate, sd_source, cold_zone_counts[sd_source], sd_target, cold_zone_counts[sd_target], start_time_for_next_op);
                 } else {
-                    start_time_for_all_ops = current_sim_time;
+                    start_time_for_next_op = current_sim_time;
                     ftl_log("Balancing triggered (Pipeline Mode, Threshold+Avg): Need %u, Migrating %u zones in parallel from SD %d (has %u) to SD %d (has %u). Start: %lu ns\n",
-                            num_to_migrate_needed, num_to_migrate, sd_source, cold_zone_counts[sd_source], sd_target, cold_zone_counts[sd_target], start_time_for_all_ops);
+                            num_to_migrate_needed, num_to_migrate, sd_source, cold_zone_counts[sd_source], sd_target, cold_zone_counts[sd_target], start_time_for_next_op);
                 }
 
                 for (uint32_t i = 0; i < num_to_migrate; i++) {
@@ -1808,7 +1811,7 @@ static void zns_check_and_balance_super_devices(FemuCtrl *n)
                         start_time_for_next_op += duration;
                     }else{
                         // 1. 调用流水线，传入 *同一个* 开始时间
-                        duration = zns_move_zone_data_pipelined(n, logical_src_idx, physical_dst_idx, start_time_for_all_ops);
+                        duration = zns_move_zone_data_pipelined(n, logical_src_idx, physical_dst_idx, start_time_for_next_op);
 
                         // 2. 累加总延迟 (串行)
                         total_accumulated_latency += duration;
