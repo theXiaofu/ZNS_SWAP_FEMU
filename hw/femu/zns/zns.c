@@ -1594,7 +1594,7 @@ static void zns_init_params(FemuCtrl *n)
     id_zns->num_lun = n->zns_params.zns_num_lun;
     id_zns->num_plane = n->zns_params.zns_num_plane;
     id_zns->num_blk = n->zns_params.zns_num_blk;
-    id_zns->num_page = n->ns_size/ZNS_PAGE_SIZE/(id_zns->num_ch*id_zns->num_lun*id_zns->num_blk);
+    id_zns->num_page = n->ns_size/ZNS_PAGE_SIZE/(id_zns->num_ch*id_zns->num_lun*id_zns->num_plane*id_zns->num_blk);
     id_zns->lbasz = 1 << zns_ns_lbads(&n->namespaces[0]);
     id_zns->flash_type = n->zns_params.zns_flash_type;
 
