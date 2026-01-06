@@ -45,7 +45,7 @@ void zftl_init(FemuCtrl *n);
     do { fprintf(stderr, "[Misao] ZFTL-Err: " fmt, ## __VA_ARGS__); } while (0)
 
 #define ftl_log(fmt, ...) \
-    do { printf("[Misao] ZFTL-Log: " fmt, ## __VA_ARGS__); } while (0)
+    do { } while (0)
 
 
 /* FEMU assert() */

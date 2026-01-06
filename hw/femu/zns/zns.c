@@ -1588,7 +1588,11 @@ static void zns_init_params(FemuCtrl *n)
     struct zns_ssd *id_zns;
     int i;
     uint64_t rev_map_sz; // 新增：用于计算反向映射表大小 Added: for calculating reverse map size
-
+    // SSD_SIZE_MB=8192
+    // NUM_CHANNELS=8
+    // NUM_CHIPS_PER_CHANNEL=1
+    // NUM_PLANES_PER_CHIP=16
+    // NUM_BLOCKS_PER_PLANE=64
     id_zns = g_malloc0(sizeof(struct zns_ssd));
     id_zns->num_ch = n->zns_params.zns_num_ch;
     id_zns->num_lun = n->zns_params.zns_num_lun;
@@ -1615,6 +1619,7 @@ static void zns_init_params(FemuCtrl *n)
     for (i = 0; i < id_zns->num_sd; i++) {
         id_zns->wp[i].ch = i * (id_zns->num_ch / id_zns->num_sd); // 每个SD的起始通道 Each SD's starting channel
         id_zns->wp[i].lun = 0;
+        id_zns->wp[i].plane = 0;
     }
 
     // id_zns->wp.ch = 0;

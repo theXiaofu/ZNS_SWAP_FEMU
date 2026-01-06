@@ -21,7 +21,7 @@
  */
 
 #define LOGICAL_PAGE_SIZE (4*KiB)
-#define ZNS_PAGE_SIZE (16*KiB)
+#define ZNS_PAGE_SIZE (4*KiB)
 #define ZNS_DEFAULT_NUM_WRITE_CACHE (3)
 #define ZNS_DEFAULT_L2P_CACHE_SIZE (1*MiB)
 
@@ -101,6 +101,7 @@ struct ppa {
 struct write_pointer {
     uint64_t ch;
     uint64_t lun;
+    uint64_t plane;
 };
 
 /*
